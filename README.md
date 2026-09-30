@@ -19,6 +19,10 @@ open-source numerical routines.
 ## Status
 
 Work in progress — see [docs/halogen/REBUILD-PLAN.md](docs/halogen/REBUILD-PLAN.md).
+The 2026-09-30 speed audit ranks this engine **56 / 100** against a
+halogen-equivalent 27B server. The weights and the upgrade order are in the
+parent repository at
+[`../variant-27b/AUDIT.md`](../variant-27b/AUDIT.md).
 
 | Component | State |
 |---|---|

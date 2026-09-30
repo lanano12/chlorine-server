@@ -3,6 +3,10 @@
 Target: a clean-room, AGPL-3.0 reimplementation of the halogen 0.1.3
 inference engine, published at `Heretek-AI/chlorine-server`.
 
+The speed standing of the engine that grew out of this plan is the 2026-09-30
+audit in the parent repository, `variant-27b/AUDIT.md` (56/100 against a
+halogen-equivalent server). This file remains the clean-room and fidelity plan.
+
 Decisions (2026-09-08):
 
 - **Fidelity bar: equivalent replica.** Same wire protocol + OpenAI API, own
