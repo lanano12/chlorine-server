@@ -872,6 +872,10 @@ static uint8_t* d_wpool = nullptr;
 static size_t g_wpool_cap = 0, g_wpool_used = 0;
 struct WEnt { size_t off; long rows, cols; int dt; };
 static std::map<std::string, WEnt> g_wmap;
+// Optional exact bf16 prefill cache on the 128 GB unified heap. Decode keeps
+// the compressed pool; cached GEMMs read the same dequantized bits as getw.
+static uint16_t* d_bfpool = nullptr;
+static std::map<std::string, uint16_t*> g_bfmap;
 
 static bool pool_add(const char* name, long rows, long cols) {
   const Ent* e = find(name);
@@ -896,7 +900,18 @@ static int gate_dt5(int l) {
   return e && e->dt == 5;
 }
 
-static void getw(const char* name, long rows, long cols, uint16_t* d_out) {
+static void getw(const char* name, long rows, long cols, uint16_t*& d_out) {
+  if (!g_bfmap.empty()) {
+    auto cached = g_bfmap.find(name);
+    auto source = g_wmap.find(name);
+    if (cached == g_bfmap.end() || source == g_wmap.end() ||
+        rows != source->second.rows || cols != source->second.cols) {
+      fprintf(stderr, "weight cache: missing tensor or shape mismatch %s\n", name);
+      exit(1);
+    }
+    d_out = cached->second;
+    return;
+  }
   auto it = g_wmap.find(name);
   if (it != g_wmap.end()) {
     const WEnt& w = it->second;
@@ -918,6 +933,51 @@ static void getw(const char* name, long rows, long cols, uint16_t* d_out) {
     if (try_find(nm2)) { load_i4l(nm2, rows, cols, d_out); return; }
   }
   load_auto(name, rows, cols, d_out);
+}
+
+static void init_bf16_weight_cache() {
+  const char* option = getenv("HALO_WEIGHT_CACHE");
+  if (!option || !strcmp(option, "0")) return;
+  if (strcmp(option, "1")) {
+    fprintf(stderr, "HALO_WEIGHT_CACHE must be 0 or 1\n"); exit(1);
+  }
+  if (!d_wpool || g_wmap.empty()) {
+    fprintf(stderr, "weight cache: unavailable without the resident compressed pool\n"); return;
+  }
+  size_t bytes = 0;
+  for (const auto& entry : g_wmap) bytes += (size_t)entry.second.rows * entry.second.cols * 2;
+  size_t free_bytes = 0, total_bytes = 0;
+  CK(hipMemGetInfo(&free_bytes, &total_bytes));
+  unsigned long long available_kb = 0;
+  if (FILE* mem = fopen("/proc/meminfo", "r")) {
+    char line[256];
+    while (fgets(line, sizeof(line), mem))
+      if (sscanf(line, "MemAvailable: %llu kB", &available_kb) == 1) break;
+    fclose(mem);
+  }
+  constexpr size_t headroom = 8ull << 30;
+  if (free_bytes < bytes + headroom || available_kb * 1024 < bytes + headroom) {
+    fprintf(stderr, "weight cache: disabled need=%zu headroom=%zu hip_free=%zu mem_available=%llu\n",
+            bytes, headroom, free_bytes, available_kb * 1024); return;
+  }
+  hipError_t rc = hipMalloc(&d_bfpool, bytes);
+  if (rc != hipSuccess) {
+    d_bfpool = nullptr;
+    fprintf(stderr, "weight cache: allocation disabled (%s)\n", hipGetErrorString(rc)); return;
+  }
+  std::map<std::string, uint16_t*> ready;
+  uint16_t* cursor = d_bfpool;
+  double start = now_s();
+  for (const auto& entry : g_wmap) {
+    uint16_t* destination = cursor;
+    getw(entry.first.c_str(), entry.second.rows, entry.second.cols, destination);
+    ready.emplace(entry.first, cursor);
+    cursor += (size_t)entry.second.rows * entry.second.cols;
+  }
+  CK(hipDeviceSynchronize());
+  g_bfmap.swap(ready);
+  fprintf(stderr, "weight cache: bf16 resident tensors=%zu bytes=%zu prepare_s=%.3f decode=compressed\n",
+          g_bfmap.size(), bytes, now_s() - start);
 }
 
 // stream one i4l tensor's raw codes + fp16 scales to device staging buffers
@@ -1112,7 +1172,10 @@ static float* d_S = nullptr; // same layout, resident across a request when HALO
 static int g_gdn_gpu = 0;    // 1 after the init compare accepts the device scan
 extern "C" int chlorine_gdn_gpu(const uint16_t* qkv, const float* gateG, const float* gateB,
                                 float* S, uint16_t* out, int T, int dnprep, float qscale);
+extern "C" int chlorine_gdn_gpu_async(const uint16_t* qkv, const float* gateG, const float* gateB,
+                                      float* S, uint16_t* out, int T, int dnprep, float qscale);
 extern "C" int chlorine_gdn_reserve(int T);
+static bool g_prefill_async = false;
 static float* h_alog;         // [48][48]
 static float* h_dtbias;       // [48][48]
 static uint16_t* h_qkvbf;     // [TMAX][10240]
@@ -1355,6 +1418,8 @@ static void flash_compare(const uint16_t* reference, const uint16_t* candidate,
     exit(1);
   }
 }
+extern "C" int chlorine_attention_flash_async(const uint16_t*, const uint16_t*,
+                                               const uint16_t*, uint16_t*, int, int);
 static void flash_call(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
                        uint16_t* O, int T, int pos_base) {
   CK((hipError_t)chlorine_attention_flash(Q, K, V, O, T, pos_base));
@@ -1375,7 +1440,9 @@ static void attention(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
     CK(hipFree(other));
     g_flash_real_checked = 1;
   } else if (g_flash) {
-    flash_call(Q, K, V, O, T, pos_base);
+    if (g_prefill_async)
+      CK((hipError_t)chlorine_attention_flash_async(Q,K,V,O,T,pos_base));
+    else flash_call(Q, K, V, O, T, pos_base);
   } else {
     attn_tiled(Q, K, V, O, T, pos_base);
   }
@@ -1385,8 +1452,12 @@ static void attention(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
 // T tokens at positions pos_base..; last-token logits [VOC] in d_logits.
 static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
   g_prefill = (T > 1);
+  const char* async = getenv("HALO_PREFILL_ASYNC");
+  // All kernels and hipBLASLt use the same default stream. Debug/profile and
+  // host GDN retain their fences; every forward still completes at logits.
+  g_prefill_async = T > 1 && async && atoi(async) == 1 && g_gdn_gpu && !g_dbg && !getenv("HALO_TIME");
   k_embed<<<GRID1((long)T * HID), 256>>>(d_tokens, d_embed, d_x, HID);
-  CK(hipDeviceSynchronize());
+  if (!g_prefill_async) CK(hipDeviceSynchronize());
   if (g_dbg) { printf("after embed:\n"); dbg_row("embed", d_x, 0, HID); }
   for (int l = 0; l < NL; l++) {
     double tw = now_s();
@@ -1429,14 +1500,14 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   getw(nm, INTM, HID, d_up);
         snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); getw(nm, HID, INTM, d_down);
       }
-      CK(hipDeviceSynchronize());
+      if (!g_prefill_async) CK(hipDeviceSynchronize());
     }
     double tload = now_s() - tw;
 
     // ---- input layernorm ----
     dumpx(d_x);
     k_rmsnorm<<<T, 256>>>(d_x, d_ln_in_all + (long)l * HID, d_ln1, HID, T, 1);
-    CK(hipDeviceSynchronize());
+    if (!g_prefill_async) CK(hipDeviceSynchronize());
 
     double tc = now_s();
     if (!fa) {
@@ -1482,7 +1553,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       }
       gemm(d_ln1, d_gdn_a + (long)gi * HV * HID, d_ab_a, T, HV, HID);
       gemm(d_ln1, d_gdn_b + (long)gi * HV * HID, d_ab_b, T, HV, HID);
-      CK(hipDeviceSynchronize());
+      if (!g_prefill_async) CK(hipDeviceSynchronize());
       { const char* dp = getenv("HALO_DUMP_QKVRAW");
         if (dp && l == 0) { void* hb = malloc((long)T * QKVW * 2);
           CK(hipDeviceSynchronize()); CK(hipMemcpy(hb, d_qkvraw, (long)T * QKVW * 2, hipMemcpyDeviceToHost));
@@ -1497,7 +1568,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         double ts = now_s();
         k_gdn_gates<<<GRID1((long)T * HV), 256>>>(d_ab_a, d_ab_b, d_alog + (long)gi * HV,
                                                   d_dtbias + (long)gi * HV, d_gateG, d_gateB, (long)T * HV);
-        int gr = chlorine_gdn_gpu(d_qkvc, d_gateG, d_gateB,
+        int gr = (g_prefill_async ? chlorine_gdn_gpu_async : chlorine_gdn_gpu)(d_qkvc, d_gateG, d_gateB,
                                   d_S + ((long)gi * HV) * DK * DV,
                                   d_co, T, g_dnprep, h_qscale);
         tscan = now_s() - ts;
@@ -1637,7 +1708,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     }
     if (g_dbg) { dbg_all("mlp_act", d_act, T, INTM); dbg_all("mlp_out", d_tmp1, T, HID); }
     k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
-    CK(hipDeviceSynchronize());
+    if (!g_prefill_async) CK(hipDeviceSynchronize());
     if (g_dbg) { printf("after L%d (%s):\n", l, fa ? "fa" : "gdn"); dbg_all("x", d_x, T, HID); }
     if (getenv("HALO_TIME")) printf("  L%d load %.2fs compute %.2fs\n", l, tload, now_s() - tc);
   }
@@ -1678,7 +1749,7 @@ static float gdn_rnd(uint32_t& rng) {
 }
 
 // Compare the device scan with gdn_scan on synthetic tokens. Disable the
-// device path when the output or the state is far from the host recurrence.
+// device path unless it satisfies the strict host recurrence contract.
 static void gdn_selfcheck() {
   const char* env = getenv("HALO_GDN");
   int force_off = env && atoi(env) == 0;
@@ -1713,17 +1784,20 @@ static void gdn_selfcheck() {
     CK(hipMemcpy(gout.data(), d_co, gout.size() * 2, hipMemcpyDeviceToHost));
     CK(hipMemcpy(gs.data(), d_S, gs.size() * 4, hipMemcpyDeviceToHost));
     double omax = 0, smax = 0;
+    bool finite = true;
     for (size_t i = 0; i < gout.size(); i++) {
+      finite = finite && std::isfinite(h_bf16f(h_co[i])) && std::isfinite(h_bf16f(gout[i]));
       double d = fabs((double)h_bf16f(h_co[i]) - (double)h_bf16f(gout[i]));
       if (d > omax) omax = d;
     }
     for (size_t i = 0; i < gs.size(); i++) {
+      finite = finite && std::isfinite(h_S[i]) && std::isfinite(gs[i]);
       double d = fabs((double)h_S[i] - (double)gs[i]);
       if (d > smax) smax = d;
     }
     fprintf(stderr, "gdn check %s T=%d dirty=%d out_maxabs %.4g state_maxabs %.4g rc %d\n",
             tag, T, dirty, omax, smax, rc);
-    if (rc != 0) omax = 1;
+    if (rc != 0 || !finite) omax = INFINITY;
     if (omax > worst_o) worst_o = omax;
     if (smax > worst_s) worst_s = smax;
   };
@@ -1732,7 +1806,7 @@ static void gdn_selfcheck() {
   one("dirty", 65, 1);
   memset(h_S, 0, (size_t)48 * HV * DK * DV * 4);
   CK(hipMemset(d_S, 0, (size_t)48 * HV * DK * DV * 4));
-  int pass = worst_o <= 0.05 && worst_s <= 0.05;
+  int pass = worst_o == 0.0 && worst_s < 1e-5;
   if (force_off || !pass) {
     g_gdn_gpu = 0;
     fprintf(stderr, "gdn: host scan (HALO_GDN=%s out %.4g state %.4g)\n",
@@ -2064,6 +2138,7 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   }
   attn_selfcheck();
   gdn_selfcheck();
+  init_bf16_weight_cache();
   g_ready = 1;
   fprintf(stderr, "trunk: ready (%.1fs)\n", now_s() - t0);
   return 0;

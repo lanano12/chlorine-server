@@ -41,9 +41,9 @@ if(HIPCC_EXECUTABLE)
     DEPENDS src/gemm_lt.cpp
     COMMENT "hipcc gemm_lt.cpp")
   add_custom_command(OUTPUT ${GDN_OBJ}
-    COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fPIC -c
+    COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fPIC -ffp-contract=off -c
             ${CMAKE_CURRENT_SOURCE_DIR}/src/gdn_gpu.hip -o ${GDN_OBJ}
-    DEPENDS src/gdn_gpu.hip
+    DEPENDS src/gdn_gpu.hip src/gdn_expf.h
     COMMENT "hipcc gdn_gpu.hip")
   add_custom_command(OUTPUT ${FLASH_OBJ}
     COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fPIC -c

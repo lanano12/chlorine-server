@@ -7,6 +7,11 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
+#include "gdn_expf.h"
+
+// Match the existing host gdn_scan, including its separate mul/add rounding.
+#pragma clang fp contract(off)
 
 static const int GDN_HK = 16;
 static const int GDN_HV = 48;
@@ -86,7 +91,7 @@ __global__ void k_gdn_prep(const uint16_t* __restrict__ qkv, float* __restrict__
 __global__ void k_gdn_grams(const float* __restrict__ Q, const float* __restrict__ K,
                             const float* __restrict__ gateG, const float* __restrict__ gateB,
                             float* __restrict__ ut, float* __restrict__ intra,
-                            int T, int Tpad) {
+                            float* __restrict__ exps, int T, int Tpad) {
   const int chunk = (int)blockIdx.x;
   const int hh = (int)blockIdx.y;
   const int tid = (int)threadIdx.x;
@@ -120,6 +125,15 @@ __global__ void k_gdn_grams(const float* __restrict__ Q, const float* __restrict
   }
   __syncthreads();
 
+  // Gate exponentials are identical across all 128 solve columns. Compute
+  // once per chunk/head instead of repeating the double-precision expf.
+  float* eh = exps + ((long)chunk * GDN_HV + hh) * (2 * CS + 1);
+  if (tid < CS) {
+    eh[tid] = gdn_expf(cum[tid]);
+    eh[CS + tid] = gdn_expf(cum[CS - 1] - cum[tid]);
+  }
+  if (tid == 0) eh[2 * CS] = gdn_expf(cum[CS - 1]);
+
   float* uth = ut + (((long)chunk * GDN_HV + hh) * CS) * CS;
   float* inh = intra + (((long)chunk * GDN_HV + hh) * CS) * CS;
   for (int a0 = 0; a0 < CS; a0 += 32) {
@@ -140,7 +154,7 @@ __global__ void k_gdn_grams(const float* __restrict__ Q, const float* __restrict
         a++;
       }
       int b = remain;
-      float decay = expf(cum[a] - cum[b]);
+      float decay = gdn_expf(cum[a] - cum[b]);
       float kbd = 0.f, qkd = 0.f;
       if (decay != 0.f) {
         const float* Ka = sK + a * STR;
@@ -163,22 +177,30 @@ __global__ void k_gdn_grams(const float* __restrict__ Q, const float* __restrict
 // One column of the 64-wide substitution, kept in named VGPRs.
 // An indexed float col[64] spilled to scratch in the earlier fused kernel.
 // Grid z covers columns 32 at a time.
+template<bool LDS_SOLVE = false>
 __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict__ K,
                             const float* __restrict__ V, const float* __restrict__ gateG,
                             const float* __restrict__ gateB, const float* __restrict__ ut,
                             float* __restrict__ nv, float* __restrict__ kcd,
                             float* __restrict__ qd, float* __restrict__ kd,
-                            int T, int Tpad) {
+                            const float* __restrict__ exps, int T, int Tpad) {
   const int chunk = (int)blockIdx.x;
   const int hh = (int)blockIdx.y;
   const int lane = (int)threadIdx.x;
-  const int col = (int)blockIdx.z * 32 + lane;
+  const int col = (int)blockIdx.z * (LDS_SOLVE ? 128 : 32) + lane;
   const int CS = GDN_CS;
   const int t0 = chunk * CS;
-  __shared__ float cum[GDN_CS];
+  const float* eh = exps + ((long)chunk * GDN_HV + hh) * (2 * CS + 1);
 
   long slot = ((long)chunk * GDN_HV + hh) * CS;
+  __shared__ float shared_ut[LDS_SOLVE ? GDN_CS * GDN_CS : 1];
   const float* uth = ut + slot * CS;
+  if constexpr (LDS_SOLVE) {
+    for (int e = lane; e < GDN_CS * GDN_CS; e += 128)
+      shared_ut[e] = e % GDN_CS <= e / GDN_CS ? uth[e] : 0.f;
+    __syncthreads();
+    uth = shared_ut;
+  }
   const float* Qh = Q + ((long)hh * Tpad) * GDN_DK;
   const float* Kh = K + ((long)hh * Tpad) * GDN_DK;
   const float* Vh = V + ((long)hh * Tpad) * GDN_DV;
@@ -186,16 +208,6 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
   float* kcdh = kcd + slot * GDN_DK;
   float* qdh = qd + slot * GDN_DK;
   float* kdh = kd + slot * GDN_DK;
-
-  if (lane == 0) {
-    float acc = 0.f;
-    for (int a = 0; a < CS; a++) {
-      int t = t0 + a;
-      acc += (t < T) ? gateG[(long)t * GDN_HV + hh] : 0.f;
-      cum[a] = acc;
-    }
-  }
-  __syncthreads();
 
   float c0; float c1; float c2; float c3; float c4; float c5; float c6; float c7; float c8; float c9; float c10; float c11; float c12; float c13; float c14; float c15; float c16; float c17; float c18; float c19; float c20; float c21; float c22; float c23; float c24; float c25; float c26; float c27; float c28; float c29; float c30; float c31; float c32; float c33; float c34; float c35; float c36; float c37; float c38; float c39; float c40; float c41; float c42; float c43; float c44; float c45; float c46; float c47; float c48; float c49; float c50; float c51; float c52; float c53; float c54; float c55; float c56; float c57; float c58; float c59; float c60; float c61; float c62; float c63;
   {
@@ -2731,8 +2743,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[0]);
-    float ecd = expf(cum[CS - 1] - cum[0]);
+    float ec = eh[0];
+    float ecd = eh[CS + 0];
     c0 = (Kv * B) * ec;
     qdh[(long)0 * GDN_DK + col] = Qv * ec;
     kdh[(long)0 * GDN_DK + col] = Kv * ecd;
@@ -2742,8 +2754,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[1]);
-    float ecd = expf(cum[CS - 1] - cum[1]);
+    float ec = eh[1];
+    float ecd = eh[CS + 1];
     c1 = (Kv * B) * ec;
     qdh[(long)1 * GDN_DK + col] = Qv * ec;
     kdh[(long)1 * GDN_DK + col] = Kv * ecd;
@@ -2753,8 +2765,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[2]);
-    float ecd = expf(cum[CS - 1] - cum[2]);
+    float ec = eh[2];
+    float ecd = eh[CS + 2];
     c2 = (Kv * B) * ec;
     qdh[(long)2 * GDN_DK + col] = Qv * ec;
     kdh[(long)2 * GDN_DK + col] = Kv * ecd;
@@ -2764,8 +2776,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[3]);
-    float ecd = expf(cum[CS - 1] - cum[3]);
+    float ec = eh[3];
+    float ecd = eh[CS + 3];
     c3 = (Kv * B) * ec;
     qdh[(long)3 * GDN_DK + col] = Qv * ec;
     kdh[(long)3 * GDN_DK + col] = Kv * ecd;
@@ -2775,8 +2787,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[4]);
-    float ecd = expf(cum[CS - 1] - cum[4]);
+    float ec = eh[4];
+    float ecd = eh[CS + 4];
     c4 = (Kv * B) * ec;
     qdh[(long)4 * GDN_DK + col] = Qv * ec;
     kdh[(long)4 * GDN_DK + col] = Kv * ecd;
@@ -2786,8 +2798,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[5]);
-    float ecd = expf(cum[CS - 1] - cum[5]);
+    float ec = eh[5];
+    float ecd = eh[CS + 5];
     c5 = (Kv * B) * ec;
     qdh[(long)5 * GDN_DK + col] = Qv * ec;
     kdh[(long)5 * GDN_DK + col] = Kv * ecd;
@@ -2797,8 +2809,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[6]);
-    float ecd = expf(cum[CS - 1] - cum[6]);
+    float ec = eh[6];
+    float ecd = eh[CS + 6];
     c6 = (Kv * B) * ec;
     qdh[(long)6 * GDN_DK + col] = Qv * ec;
     kdh[(long)6 * GDN_DK + col] = Kv * ecd;
@@ -2808,8 +2820,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[7]);
-    float ecd = expf(cum[CS - 1] - cum[7]);
+    float ec = eh[7];
+    float ecd = eh[CS + 7];
     c7 = (Kv * B) * ec;
     qdh[(long)7 * GDN_DK + col] = Qv * ec;
     kdh[(long)7 * GDN_DK + col] = Kv * ecd;
@@ -2819,8 +2831,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[8]);
-    float ecd = expf(cum[CS - 1] - cum[8]);
+    float ec = eh[8];
+    float ecd = eh[CS + 8];
     c8 = (Kv * B) * ec;
     qdh[(long)8 * GDN_DK + col] = Qv * ec;
     kdh[(long)8 * GDN_DK + col] = Kv * ecd;
@@ -2830,8 +2842,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[9]);
-    float ecd = expf(cum[CS - 1] - cum[9]);
+    float ec = eh[9];
+    float ecd = eh[CS + 9];
     c9 = (Kv * B) * ec;
     qdh[(long)9 * GDN_DK + col] = Qv * ec;
     kdh[(long)9 * GDN_DK + col] = Kv * ecd;
@@ -2841,8 +2853,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[10]);
-    float ecd = expf(cum[CS - 1] - cum[10]);
+    float ec = eh[10];
+    float ecd = eh[CS + 10];
     c10 = (Kv * B) * ec;
     qdh[(long)10 * GDN_DK + col] = Qv * ec;
     kdh[(long)10 * GDN_DK + col] = Kv * ecd;
@@ -2852,8 +2864,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[11]);
-    float ecd = expf(cum[CS - 1] - cum[11]);
+    float ec = eh[11];
+    float ecd = eh[CS + 11];
     c11 = (Kv * B) * ec;
     qdh[(long)11 * GDN_DK + col] = Qv * ec;
     kdh[(long)11 * GDN_DK + col] = Kv * ecd;
@@ -2863,8 +2875,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[12]);
-    float ecd = expf(cum[CS - 1] - cum[12]);
+    float ec = eh[12];
+    float ecd = eh[CS + 12];
     c12 = (Kv * B) * ec;
     qdh[(long)12 * GDN_DK + col] = Qv * ec;
     kdh[(long)12 * GDN_DK + col] = Kv * ecd;
@@ -2874,8 +2886,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[13]);
-    float ecd = expf(cum[CS - 1] - cum[13]);
+    float ec = eh[13];
+    float ecd = eh[CS + 13];
     c13 = (Kv * B) * ec;
     qdh[(long)13 * GDN_DK + col] = Qv * ec;
     kdh[(long)13 * GDN_DK + col] = Kv * ecd;
@@ -2885,8 +2897,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[14]);
-    float ecd = expf(cum[CS - 1] - cum[14]);
+    float ec = eh[14];
+    float ecd = eh[CS + 14];
     c14 = (Kv * B) * ec;
     qdh[(long)14 * GDN_DK + col] = Qv * ec;
     kdh[(long)14 * GDN_DK + col] = Kv * ecd;
@@ -2896,8 +2908,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[15]);
-    float ecd = expf(cum[CS - 1] - cum[15]);
+    float ec = eh[15];
+    float ecd = eh[CS + 15];
     c15 = (Kv * B) * ec;
     qdh[(long)15 * GDN_DK + col] = Qv * ec;
     kdh[(long)15 * GDN_DK + col] = Kv * ecd;
@@ -2907,8 +2919,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[16]);
-    float ecd = expf(cum[CS - 1] - cum[16]);
+    float ec = eh[16];
+    float ecd = eh[CS + 16];
     c16 = (Kv * B) * ec;
     qdh[(long)16 * GDN_DK + col] = Qv * ec;
     kdh[(long)16 * GDN_DK + col] = Kv * ecd;
@@ -2918,8 +2930,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[17]);
-    float ecd = expf(cum[CS - 1] - cum[17]);
+    float ec = eh[17];
+    float ecd = eh[CS + 17];
     c17 = (Kv * B) * ec;
     qdh[(long)17 * GDN_DK + col] = Qv * ec;
     kdh[(long)17 * GDN_DK + col] = Kv * ecd;
@@ -2929,8 +2941,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[18]);
-    float ecd = expf(cum[CS - 1] - cum[18]);
+    float ec = eh[18];
+    float ecd = eh[CS + 18];
     c18 = (Kv * B) * ec;
     qdh[(long)18 * GDN_DK + col] = Qv * ec;
     kdh[(long)18 * GDN_DK + col] = Kv * ecd;
@@ -2940,8 +2952,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[19]);
-    float ecd = expf(cum[CS - 1] - cum[19]);
+    float ec = eh[19];
+    float ecd = eh[CS + 19];
     c19 = (Kv * B) * ec;
     qdh[(long)19 * GDN_DK + col] = Qv * ec;
     kdh[(long)19 * GDN_DK + col] = Kv * ecd;
@@ -2951,8 +2963,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[20]);
-    float ecd = expf(cum[CS - 1] - cum[20]);
+    float ec = eh[20];
+    float ecd = eh[CS + 20];
     c20 = (Kv * B) * ec;
     qdh[(long)20 * GDN_DK + col] = Qv * ec;
     kdh[(long)20 * GDN_DK + col] = Kv * ecd;
@@ -2962,8 +2974,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[21]);
-    float ecd = expf(cum[CS - 1] - cum[21]);
+    float ec = eh[21];
+    float ecd = eh[CS + 21];
     c21 = (Kv * B) * ec;
     qdh[(long)21 * GDN_DK + col] = Qv * ec;
     kdh[(long)21 * GDN_DK + col] = Kv * ecd;
@@ -2973,8 +2985,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[22]);
-    float ecd = expf(cum[CS - 1] - cum[22]);
+    float ec = eh[22];
+    float ecd = eh[CS + 22];
     c22 = (Kv * B) * ec;
     qdh[(long)22 * GDN_DK + col] = Qv * ec;
     kdh[(long)22 * GDN_DK + col] = Kv * ecd;
@@ -2984,8 +2996,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[23]);
-    float ecd = expf(cum[CS - 1] - cum[23]);
+    float ec = eh[23];
+    float ecd = eh[CS + 23];
     c23 = (Kv * B) * ec;
     qdh[(long)23 * GDN_DK + col] = Qv * ec;
     kdh[(long)23 * GDN_DK + col] = Kv * ecd;
@@ -2995,8 +3007,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[24]);
-    float ecd = expf(cum[CS - 1] - cum[24]);
+    float ec = eh[24];
+    float ecd = eh[CS + 24];
     c24 = (Kv * B) * ec;
     qdh[(long)24 * GDN_DK + col] = Qv * ec;
     kdh[(long)24 * GDN_DK + col] = Kv * ecd;
@@ -3006,8 +3018,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[25]);
-    float ecd = expf(cum[CS - 1] - cum[25]);
+    float ec = eh[25];
+    float ecd = eh[CS + 25];
     c25 = (Kv * B) * ec;
     qdh[(long)25 * GDN_DK + col] = Qv * ec;
     kdh[(long)25 * GDN_DK + col] = Kv * ecd;
@@ -3017,8 +3029,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[26]);
-    float ecd = expf(cum[CS - 1] - cum[26]);
+    float ec = eh[26];
+    float ecd = eh[CS + 26];
     c26 = (Kv * B) * ec;
     qdh[(long)26 * GDN_DK + col] = Qv * ec;
     kdh[(long)26 * GDN_DK + col] = Kv * ecd;
@@ -3028,8 +3040,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[27]);
-    float ecd = expf(cum[CS - 1] - cum[27]);
+    float ec = eh[27];
+    float ecd = eh[CS + 27];
     c27 = (Kv * B) * ec;
     qdh[(long)27 * GDN_DK + col] = Qv * ec;
     kdh[(long)27 * GDN_DK + col] = Kv * ecd;
@@ -3039,8 +3051,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[28]);
-    float ecd = expf(cum[CS - 1] - cum[28]);
+    float ec = eh[28];
+    float ecd = eh[CS + 28];
     c28 = (Kv * B) * ec;
     qdh[(long)28 * GDN_DK + col] = Qv * ec;
     kdh[(long)28 * GDN_DK + col] = Kv * ecd;
@@ -3050,8 +3062,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[29]);
-    float ecd = expf(cum[CS - 1] - cum[29]);
+    float ec = eh[29];
+    float ecd = eh[CS + 29];
     c29 = (Kv * B) * ec;
     qdh[(long)29 * GDN_DK + col] = Qv * ec;
     kdh[(long)29 * GDN_DK + col] = Kv * ecd;
@@ -3061,8 +3073,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[30]);
-    float ecd = expf(cum[CS - 1] - cum[30]);
+    float ec = eh[30];
+    float ecd = eh[CS + 30];
     c30 = (Kv * B) * ec;
     qdh[(long)30 * GDN_DK + col] = Qv * ec;
     kdh[(long)30 * GDN_DK + col] = Kv * ecd;
@@ -3072,8 +3084,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[31]);
-    float ecd = expf(cum[CS - 1] - cum[31]);
+    float ec = eh[31];
+    float ecd = eh[CS + 31];
     c31 = (Kv * B) * ec;
     qdh[(long)31 * GDN_DK + col] = Qv * ec;
     kdh[(long)31 * GDN_DK + col] = Kv * ecd;
@@ -3083,8 +3095,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[32]);
-    float ecd = expf(cum[CS - 1] - cum[32]);
+    float ec = eh[32];
+    float ecd = eh[CS + 32];
     c32 = (Kv * B) * ec;
     qdh[(long)32 * GDN_DK + col] = Qv * ec;
     kdh[(long)32 * GDN_DK + col] = Kv * ecd;
@@ -3094,8 +3106,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[33]);
-    float ecd = expf(cum[CS - 1] - cum[33]);
+    float ec = eh[33];
+    float ecd = eh[CS + 33];
     c33 = (Kv * B) * ec;
     qdh[(long)33 * GDN_DK + col] = Qv * ec;
     kdh[(long)33 * GDN_DK + col] = Kv * ecd;
@@ -3105,8 +3117,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[34]);
-    float ecd = expf(cum[CS - 1] - cum[34]);
+    float ec = eh[34];
+    float ecd = eh[CS + 34];
     c34 = (Kv * B) * ec;
     qdh[(long)34 * GDN_DK + col] = Qv * ec;
     kdh[(long)34 * GDN_DK + col] = Kv * ecd;
@@ -3116,8 +3128,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[35]);
-    float ecd = expf(cum[CS - 1] - cum[35]);
+    float ec = eh[35];
+    float ecd = eh[CS + 35];
     c35 = (Kv * B) * ec;
     qdh[(long)35 * GDN_DK + col] = Qv * ec;
     kdh[(long)35 * GDN_DK + col] = Kv * ecd;
@@ -3127,8 +3139,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[36]);
-    float ecd = expf(cum[CS - 1] - cum[36]);
+    float ec = eh[36];
+    float ecd = eh[CS + 36];
     c36 = (Kv * B) * ec;
     qdh[(long)36 * GDN_DK + col] = Qv * ec;
     kdh[(long)36 * GDN_DK + col] = Kv * ecd;
@@ -3138,8 +3150,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[37]);
-    float ecd = expf(cum[CS - 1] - cum[37]);
+    float ec = eh[37];
+    float ecd = eh[CS + 37];
     c37 = (Kv * B) * ec;
     qdh[(long)37 * GDN_DK + col] = Qv * ec;
     kdh[(long)37 * GDN_DK + col] = Kv * ecd;
@@ -3149,8 +3161,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[38]);
-    float ecd = expf(cum[CS - 1] - cum[38]);
+    float ec = eh[38];
+    float ecd = eh[CS + 38];
     c38 = (Kv * B) * ec;
     qdh[(long)38 * GDN_DK + col] = Qv * ec;
     kdh[(long)38 * GDN_DK + col] = Kv * ecd;
@@ -3160,8 +3172,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[39]);
-    float ecd = expf(cum[CS - 1] - cum[39]);
+    float ec = eh[39];
+    float ecd = eh[CS + 39];
     c39 = (Kv * B) * ec;
     qdh[(long)39 * GDN_DK + col] = Qv * ec;
     kdh[(long)39 * GDN_DK + col] = Kv * ecd;
@@ -3171,8 +3183,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[40]);
-    float ecd = expf(cum[CS - 1] - cum[40]);
+    float ec = eh[40];
+    float ecd = eh[CS + 40];
     c40 = (Kv * B) * ec;
     qdh[(long)40 * GDN_DK + col] = Qv * ec;
     kdh[(long)40 * GDN_DK + col] = Kv * ecd;
@@ -3182,8 +3194,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[41]);
-    float ecd = expf(cum[CS - 1] - cum[41]);
+    float ec = eh[41];
+    float ecd = eh[CS + 41];
     c41 = (Kv * B) * ec;
     qdh[(long)41 * GDN_DK + col] = Qv * ec;
     kdh[(long)41 * GDN_DK + col] = Kv * ecd;
@@ -3193,8 +3205,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[42]);
-    float ecd = expf(cum[CS - 1] - cum[42]);
+    float ec = eh[42];
+    float ecd = eh[CS + 42];
     c42 = (Kv * B) * ec;
     qdh[(long)42 * GDN_DK + col] = Qv * ec;
     kdh[(long)42 * GDN_DK + col] = Kv * ecd;
@@ -3204,8 +3216,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[43]);
-    float ecd = expf(cum[CS - 1] - cum[43]);
+    float ec = eh[43];
+    float ecd = eh[CS + 43];
     c43 = (Kv * B) * ec;
     qdh[(long)43 * GDN_DK + col] = Qv * ec;
     kdh[(long)43 * GDN_DK + col] = Kv * ecd;
@@ -3215,8 +3227,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[44]);
-    float ecd = expf(cum[CS - 1] - cum[44]);
+    float ec = eh[44];
+    float ecd = eh[CS + 44];
     c44 = (Kv * B) * ec;
     qdh[(long)44 * GDN_DK + col] = Qv * ec;
     kdh[(long)44 * GDN_DK + col] = Kv * ecd;
@@ -3226,8 +3238,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[45]);
-    float ecd = expf(cum[CS - 1] - cum[45]);
+    float ec = eh[45];
+    float ecd = eh[CS + 45];
     c45 = (Kv * B) * ec;
     qdh[(long)45 * GDN_DK + col] = Qv * ec;
     kdh[(long)45 * GDN_DK + col] = Kv * ecd;
@@ -3237,8 +3249,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[46]);
-    float ecd = expf(cum[CS - 1] - cum[46]);
+    float ec = eh[46];
+    float ecd = eh[CS + 46];
     c46 = (Kv * B) * ec;
     qdh[(long)46 * GDN_DK + col] = Qv * ec;
     kdh[(long)46 * GDN_DK + col] = Kv * ecd;
@@ -3248,8 +3260,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[47]);
-    float ecd = expf(cum[CS - 1] - cum[47]);
+    float ec = eh[47];
+    float ecd = eh[CS + 47];
     c47 = (Kv * B) * ec;
     qdh[(long)47 * GDN_DK + col] = Qv * ec;
     kdh[(long)47 * GDN_DK + col] = Kv * ecd;
@@ -3259,8 +3271,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[48]);
-    float ecd = expf(cum[CS - 1] - cum[48]);
+    float ec = eh[48];
+    float ecd = eh[CS + 48];
     c48 = (Kv * B) * ec;
     qdh[(long)48 * GDN_DK + col] = Qv * ec;
     kdh[(long)48 * GDN_DK + col] = Kv * ecd;
@@ -3270,8 +3282,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[49]);
-    float ecd = expf(cum[CS - 1] - cum[49]);
+    float ec = eh[49];
+    float ecd = eh[CS + 49];
     c49 = (Kv * B) * ec;
     qdh[(long)49 * GDN_DK + col] = Qv * ec;
     kdh[(long)49 * GDN_DK + col] = Kv * ecd;
@@ -3281,8 +3293,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[50]);
-    float ecd = expf(cum[CS - 1] - cum[50]);
+    float ec = eh[50];
+    float ecd = eh[CS + 50];
     c50 = (Kv * B) * ec;
     qdh[(long)50 * GDN_DK + col] = Qv * ec;
     kdh[(long)50 * GDN_DK + col] = Kv * ecd;
@@ -3292,8 +3304,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[51]);
-    float ecd = expf(cum[CS - 1] - cum[51]);
+    float ec = eh[51];
+    float ecd = eh[CS + 51];
     c51 = (Kv * B) * ec;
     qdh[(long)51 * GDN_DK + col] = Qv * ec;
     kdh[(long)51 * GDN_DK + col] = Kv * ecd;
@@ -3303,8 +3315,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[52]);
-    float ecd = expf(cum[CS - 1] - cum[52]);
+    float ec = eh[52];
+    float ecd = eh[CS + 52];
     c52 = (Kv * B) * ec;
     qdh[(long)52 * GDN_DK + col] = Qv * ec;
     kdh[(long)52 * GDN_DK + col] = Kv * ecd;
@@ -3314,8 +3326,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[53]);
-    float ecd = expf(cum[CS - 1] - cum[53]);
+    float ec = eh[53];
+    float ecd = eh[CS + 53];
     c53 = (Kv * B) * ec;
     qdh[(long)53 * GDN_DK + col] = Qv * ec;
     kdh[(long)53 * GDN_DK + col] = Kv * ecd;
@@ -3325,8 +3337,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[54]);
-    float ecd = expf(cum[CS - 1] - cum[54]);
+    float ec = eh[54];
+    float ecd = eh[CS + 54];
     c54 = (Kv * B) * ec;
     qdh[(long)54 * GDN_DK + col] = Qv * ec;
     kdh[(long)54 * GDN_DK + col] = Kv * ecd;
@@ -3336,8 +3348,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[55]);
-    float ecd = expf(cum[CS - 1] - cum[55]);
+    float ec = eh[55];
+    float ecd = eh[CS + 55];
     c55 = (Kv * B) * ec;
     qdh[(long)55 * GDN_DK + col] = Qv * ec;
     kdh[(long)55 * GDN_DK + col] = Kv * ecd;
@@ -3347,8 +3359,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[56]);
-    float ecd = expf(cum[CS - 1] - cum[56]);
+    float ec = eh[56];
+    float ecd = eh[CS + 56];
     c56 = (Kv * B) * ec;
     qdh[(long)56 * GDN_DK + col] = Qv * ec;
     kdh[(long)56 * GDN_DK + col] = Kv * ecd;
@@ -3358,8 +3370,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[57]);
-    float ecd = expf(cum[CS - 1] - cum[57]);
+    float ec = eh[57];
+    float ecd = eh[CS + 57];
     c57 = (Kv * B) * ec;
     qdh[(long)57 * GDN_DK + col] = Qv * ec;
     kdh[(long)57 * GDN_DK + col] = Kv * ecd;
@@ -3369,8 +3381,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[58]);
-    float ecd = expf(cum[CS - 1] - cum[58]);
+    float ec = eh[58];
+    float ecd = eh[CS + 58];
     c58 = (Kv * B) * ec;
     qdh[(long)58 * GDN_DK + col] = Qv * ec;
     kdh[(long)58 * GDN_DK + col] = Kv * ecd;
@@ -3380,8 +3392,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[59]);
-    float ecd = expf(cum[CS - 1] - cum[59]);
+    float ec = eh[59];
+    float ecd = eh[CS + 59];
     c59 = (Kv * B) * ec;
     qdh[(long)59 * GDN_DK + col] = Qv * ec;
     kdh[(long)59 * GDN_DK + col] = Kv * ecd;
@@ -3391,8 +3403,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[60]);
-    float ecd = expf(cum[CS - 1] - cum[60]);
+    float ec = eh[60];
+    float ecd = eh[CS + 60];
     c60 = (Kv * B) * ec;
     qdh[(long)60 * GDN_DK + col] = Qv * ec;
     kdh[(long)60 * GDN_DK + col] = Kv * ecd;
@@ -3402,8 +3414,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[61]);
-    float ecd = expf(cum[CS - 1] - cum[61]);
+    float ec = eh[61];
+    float ecd = eh[CS + 61];
     c61 = (Kv * B) * ec;
     qdh[(long)61 * GDN_DK + col] = Qv * ec;
     kdh[(long)61 * GDN_DK + col] = Kv * ecd;
@@ -3413,8 +3425,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[62]);
-    float ecd = expf(cum[CS - 1] - cum[62]);
+    float ec = eh[62];
+    float ecd = eh[CS + 62];
     c62 = (Kv * B) * ec;
     qdh[(long)62 * GDN_DK + col] = Qv * ec;
     kdh[(long)62 * GDN_DK + col] = Kv * ecd;
@@ -3424,8 +3436,8 @@ __global__ void k_gdn_solve(const float* __restrict__ Q, const float* __restrict
     float B = (t < T) ? gateB[(long)t * GDN_HV + hh] : 0.f;
     float Kv = (t < T) ? Kh[(long)t * GDN_DK + col] : 0.f;
     float Qv = (t < T) ? Qh[(long)t * GDN_DK + col] : 0.f;
-    float ec = expf(cum[63]);
-    float ecd = expf(cum[CS - 1] - cum[63]);
+    float ec = eh[63];
+    float ecd = eh[CS + 63];
     c63 = (Kv * B) * ec;
     qdh[(long)63 * GDN_DK + col] = Qv * ec;
     kdh[(long)63 * GDN_DK + col] = Kv * ecd;
@@ -5626,7 +5638,7 @@ __global__ void k_gdn_out(const float* __restrict__ vn, const float* __restrict_
 // One warp owns one state row and four columns per lane. kd is broadcast,
 // vn arrives as an aligned float4, and the four FMAs are independent.
 __global__ void k_gdn_state(float* __restrict__ S, const float* __restrict__ kd,
-                            const float* __restrict__ vn, const float* __restrict__ gateG,
+                            const float* __restrict__ vn, const float* __restrict__ exps,
                             int chunk, int T) {
   const int i = (int)blockIdx.x;
   const int hh = (int)blockIdx.y;
@@ -5634,12 +5646,7 @@ __global__ void k_gdn_state(float* __restrict__ S, const float* __restrict__ kd,
   const int j = lane * 4;
   const int CS = GDN_CS;
   const int t0 = chunk * CS;
-  float acc = 0.f;
-  for (int a = 0; a < CS; a++) {
-    int t = t0 + a;
-    acc += (t < T) ? gateG[(long)t * GDN_HV + hh] : 0.f;
-  }
-  float decay = expf(acc);
+  float decay = exps[((long)chunk * GDN_HV + hh) * (2 * CS + 1) + 2 * CS];
   long sbase = ((long)hh * GDN_DK + i) * GDN_DV + j;
   float s0 = S[sbase] * decay;
   float s1 = S[sbase + 1] * decay;
@@ -5662,9 +5669,77 @@ __global__ void k_gdn_state(float* __restrict__ S, const float* __restrict__ kd,
 
 
 
+// One workgroup owns 32 columns of a head's recurrent state for the entire
+// scan. All reductions retain the host's i/b/a order. No inter-workgroup
+// synchronization is needed: output columns and state columns are disjoint.
+// This replaces three launches per chunk with one launch for all chunks.
+template<int NC>
+__global__ void __launch_bounds__(NC * 32)
+k_gdn_scan_persistent(const float* __restrict__ kcd, const float* __restrict__ qd,
+                      const float* __restrict__ nv, const float* __restrict__ kd,
+                      const float* __restrict__ intra, const float* __restrict__ exps,
+                      float* __restrict__ S, uint16_t* __restrict__ out, int T) {
+  constexpr int NT = NC * 32, ROWS_PER_THREAD = GDN_CS * NC / NT;
+  const int tid = threadIdx.x, hh = blockIdx.x, col0 = blockIdx.y * NC;
+  const int j = tid % NC;
+  __shared__ float st[GDN_DK][NC];
+  __shared__ float vn[GDN_CS][NC];
+  for (int e = tid; e < GDN_DK * NC; e += NT) {
+    int i = e / NC, col = e % NC;
+    st[i][col] = S[((long)hh * GDN_DK + i) * GDN_DV + col0 + col];
+  }
+  __syncthreads();
+  const int nch = (T + GDN_CS - 1) / GDN_CS;
+  for (int c = 0; c < nch; c++) {
+    const long base = ((long)c * GDN_HV + hh) * GDN_CS;
+    float inter[ROWS_PER_THREAD];
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_THREAD; r++) {
+      const int a = tid / NC + r * (NT / NC);
+      const float* kr = kcd + (base + a) * GDN_DK;
+      const float* qr = qd + (base + a) * GDN_DK;
+      float s1 = 0.f, s2 = 0.f;
+      for (int i = 0; i < GDN_DK; i++) {
+        const float si = st[i][j];
+        s1 += kr[i] * si;
+        s2 += qr[i] * si;
+      }
+      vn[a][j] = nv[(base + a) * GDN_DV + col0 + j] - s1;
+      inter[r] = s2;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_THREAD; r++) {
+      const int a = tid / NC + r * (NT / NC);
+      const float* wr = intra + (base + a) * GDN_CS;
+      float value = inter[r];
+      for (int b = 0; b <= a; b++) {
+        const float w = wr[b];
+        if (w != 0.f) value += w * vn[b][j];
+      }
+      const int t = c * GDN_CS + a;
+      if (t < T) out[(long)t * GDN_HV * GDN_DV + hh * GDN_DV + col0 + j] = gdn_f32bf_host(value);
+    }
+    const float decay = exps[((long)c * GDN_HV + hh) * (2 * GDN_CS + 1) + 2 * GDN_CS];
+    for (int e = tid; e < GDN_DK * NC; e += NT) {
+      const int i = e / NC;
+      float value = st[i][j] * decay;
+      for (int a = 0; a < GDN_CS; a++)
+        value += kd[(base + a) * GDN_DK + i] * vn[a][j];
+      st[i][j] = value;
+    }
+    // State is complete and all readers of vn finished before the next chunk.
+    __syncthreads();
+  }
+  for (int e = tid; e < GDN_DK * NC; e += NT) {
+    const int i = e / NC;
+    S[((long)hh * GDN_DK + i) * GDN_DV + col0 + j] = st[i][j];
+  }
+}
+
 static float* g_blob = nullptr;
 static int g_tpad = 0;
-static float *g_Q, *g_K, *g_V, *g_nv, *g_kcd, *g_qd, *g_kd, *g_vn, *g_s2, *g_ut, *g_intra;
+static float *g_Q, *g_K, *g_V, *g_nv, *g_kcd, *g_qd, *g_kd, *g_vn, *g_s2, *g_ut, *g_intra, *g_exps;
 
 static int gdn_ck(hipError_t e, const char* what) {
   if (e == hipSuccess) return 0;
@@ -5685,7 +5760,8 @@ static int gdn_ensure(int T) {
   size_t nQ = (size_t)GDN_HV * (size_t)tpad * GDN_DK;
   size_t nC = (size_t)nch * GDN_HV * GDN_CS * GDN_DK;
   size_t nU = (size_t)nch * GDN_HV * GDN_CS * GDN_CS;
-  size_t n = nQ * 3 + nC * 6 + nU * 2;
+  size_t nE = (size_t)nch * GDN_HV * (2 * GDN_CS + 1);
+  size_t n = nQ * 3 + nC * 6 + nU * 2 + nE;
   if (gdn_ck(hipMalloc(&g_blob, n * sizeof(float)), "alloc")) return -1;
   float* p = g_blob;
   g_Q = p; p += nQ;
@@ -5698,15 +5774,16 @@ static int gdn_ensure(int T) {
   g_vn = p; p += nC;
   g_s2 = p; p += nC;
   g_ut = p; p += nU;
-  g_intra = p;
+  g_intra = p; p += nU;
+  g_exps = p;
   g_tpad = tpad;
   fprintf(stderr, "gdn workspace: reserved Tpad=%d bytes=%zu Q/K/V_head_stride=%ld\n",
           g_tpad, n * sizeof(float), (long)g_tpad * GDN_DK);
   return 0;
 }
 
-extern "C" int chlorine_gdn_gpu(const uint16_t* qkv, const float* gateG, const float* gateB,
-                                float* S, uint16_t* out, int T, int dnprep, float qscale) {
+static int gdn_gpu_impl(const uint16_t* qkv, const float* gateG, const float* gateB,
+                                float* S, uint16_t* out, int T, int dnprep, float qscale, bool sync) {
   int rc = gdn_ensure(T);
   if (rc) return rc;
   int tpad = g_tpad;
@@ -5716,21 +5793,45 @@ extern "C" int chlorine_gdn_gpu(const uint16_t* qkv, const float* gateG, const f
   k_gdn_prep<<<nprep, 256>>>(qkv, g_Q, g_K, g_V, T, tpad, dnprep, qscale);
   if (gdn_ck(hipGetLastError(), "prep")) return -2;
   dim3 grams(nch, GDN_HV);
-  k_gdn_grams<<<grams, 256>>>(g_Q, g_K, gateG, gateB, g_ut, g_intra, T, tpad);
+  k_gdn_grams<<<grams, 256>>>(g_Q, g_K, gateG, gateB, g_ut, g_intra, g_exps, T, tpad);
   if (gdn_ck(hipGetLastError(), "grams")) return -2;
   dim3 solve(nch, GDN_HV, 4);
-  k_gdn_solve<<<solve, 32>>>(g_Q, g_K, g_V, gateG, gateB, g_ut, g_nv, g_kcd, g_qd, g_kd, T, tpad);
+  const char* lds_solve = getenv("HALO_GDN_SOLVE_LDS");
+  if (lds_solve && atoi(lds_solve) == 1)
+    k_gdn_solve<true><<<dim3(nch, GDN_HV), 128>>>(g_Q, g_K, g_V, gateG, gateB, g_ut, g_nv, g_kcd, g_qd, g_kd, g_exps, T, tpad);
+  else
+    k_gdn_solve<false><<<solve, 32>>>(g_Q, g_K, g_V, gateG, gateB, g_ut, g_nv, g_kcd, g_qd, g_kd, g_exps, T, tpad);
   if (gdn_ck(hipGetLastError(), "solve")) return -2;
   int nvec = GDN_HV * GDN_CS * GDN_DV;
   dim3 state(GDN_DK, GDN_HV);
-  for (int c = 0; c < nch; c++) {
+  const char* persistent = getenv("HALO_GDN_PERSISTENT");
+  const int strip = persistent ? atoi(persistent) : 0;
+  if (strip) {
+    if (strip == 32)
+      k_gdn_scan_persistent<32><<<dim3(GDN_HV, GDN_DV / 32), 1024>>>(g_kcd, g_qd, g_nv, g_kd, g_intra, g_exps, S, out, T);
+    else if (strip == 8)
+      k_gdn_scan_persistent<8><<<dim3(GDN_HV, GDN_DV / 8), 256>>>(g_kcd, g_qd, g_nv, g_kd, g_intra, g_exps, S, out, T);
+    else
+      k_gdn_scan_persistent<16><<<dim3(GDN_HV, GDN_DV / 16), 512>>>(g_kcd, g_qd, g_nv, g_kd, g_intra, g_exps, S, out, T);
+  } else for (int c = 0; c < nch; c++) {
     k_gdn_gemv<<<(nvec + 255) / 256, 256>>>(g_kcd, g_qd, g_nv, S, g_vn, g_s2, c, nvec);
     k_gdn_out<<<(nvec + 255) / 256, 256>>>(g_vn, g_s2, g_intra, out, c, T, nvec);
-    k_gdn_state<<<state, 32>>>(S, g_kd, g_vn, gateG, c, T);
+    k_gdn_state<<<state, 32>>>(S, g_kd, g_vn, g_exps, c, T);
   }
   if (gdn_ck(hipGetLastError(), "scan")) return -2;
-  if (gdn_ck(hipDeviceSynchronize(), "sync")) return -2;
+  if (sync && gdn_ck(hipDeviceSynchronize(), "sync")) return -2;
   return 0;
+}
+
+// The standalone correctness API remains synchronous. Only the engine's
+// stream-ordered prefill may defer completion until the final logits fence.
+extern "C" int chlorine_gdn_gpu(const uint16_t* qkv, const float* G, const float* B,
+                                float* S, uint16_t* out, int T, int dnprep, float qscale) {
+  return gdn_gpu_impl(qkv,G,B,S,out,T,dnprep,qscale,true);
+}
+extern "C" int chlorine_gdn_gpu_async(const uint16_t* qkv, const float* G, const float* B,
+                                      float* S, uint16_t* out, int T, int dnprep, float qscale) {
+  return gdn_gpu_impl(qkv,G,B,S,out,T,dnprep,qscale,false);
 }
 
 extern "C" int chlorine_gdn_reserve(int T) {
