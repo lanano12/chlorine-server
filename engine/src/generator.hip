@@ -40,12 +40,15 @@ static const int   NPAIR = 32;        // rotary pairs (partial 0.25 -> 64 dims)
 static const float SCALE = 0.0625f;   // 1/sqrt(256)
 static const float THETA = 1e7f;
 static const float EPS   = 1e-6f;
-// KV holds the prompt plus generated tokens. Activations and the logit
-// matrix are sized to TMAX, which is the longest single prefill.
-// Attention stores one query tile of scores, not QH*CXT*CXT. The cap stays
-// at 1024 rows until a 32768 prefill is measured; CXT is the KV length.
-static const int   CXT   = 1088;
-static const int   TMAX  = 1024;
+// Build limits are explicit CMake settings; logits hold only the last row.
+#ifndef CHLORINE_CXT
+#define CHLORINE_CXT 1088
+#endif
+#ifndef CHLORINE_TMAX
+#define CHLORINE_TMAX 1024
+#endif
+static const int   CXT   = CHLORINE_CXT;
+static const int   TMAX  = CHLORINE_TMAX;
 static const int   ATTN_TILE = 32; // query rows scored at once
 static_assert(TMAX <= CXT - 2, "prefill rows must fit in the KV cache with room to decode");
 static_assert(ATTN_TILE >= 1, "attention tile");
@@ -1133,15 +1136,23 @@ static int g_actq = 0;    // engine-default serve prefill is CLEAN; HALO_ACTQ=3 
                           // the forced-bench W4A4 prefill (mean-NLL 5.9406 vs 5.918531)
 static int g_dnprep = 1;  // 1: round l2normed q/k to bf16 (engine inter-kernel dtype)
 static int g_beta32 = 0;  // 0: beta stays f32 (k_dn_gates emits f32) — matches engine clean path
+static int g_flash = 0;   // HALO_FLASH_WMMA=1, explicit opt-in; default reference
+static int g_flash_real_checked = 0;
+extern "C" int chlorine_attention_flash(const uint16_t*, const uint16_t*,
+                                         const uint16_t*, uint16_t*, int, int);
 static void dbg_all(const char* tag, const uint16_t* d_buf, long rows, long width) {
-  static uint16_t tmp[TMAX * 17408];
-  CK(hipMemcpy(tmp, d_buf, rows * width * 2, hipMemcpyDeviceToHost));
+  // Bounded staging even when the activation is a full 32K prefill.
+  std::vector<uint16_t> tmp(std::min<long>(rows * width, 1 << 20));
   double mx = 0, sm = 0; long nan = 0;
-  for (long i = 0; i < rows * width; i++) {
-    float v = h_bf16f(tmp[i]);
-    if (v != v) nan++;
-    if (fabs(v) > mx) mx = fabs(v);
-    sm += v;
+  for (long base = 0; base < rows * width; base += (long)tmp.size()) {
+    long count = std::min<long>((long)tmp.size(), rows * width - base);
+    CK(hipMemcpy(tmp.data(), d_buf + base, (size_t)count * 2, hipMemcpyDeviceToHost));
+    for (long i = 0; i < count; i++) {
+      float v = h_bf16f(tmp[i]);
+      if (v != v) nan++;
+      if (fabs(v) > mx) mx = fabs(v);
+      sm += v;
+    }
   }
   printf("  [%s] allrows mean=%.4g maxabs=%.4g nan=%ld\n", tag, sm / (rows * width), mx, nan);
 }
@@ -1320,8 +1331,58 @@ static void attn_tiled(const uint16_t* Q, const uint16_t* KC, const uint16_t* VC
   CK(hipDeviceSynchronize());
 }
 
+// Numeric-change guard, not an exact-match assertion. Both maximum error and
+// bf16 differences are printed, along with the changed softmax/rounding order.
+static void flash_compare(const uint16_t* reference, const uint16_t* candidate,
+                          long n, const char* tag, int T, int pos_base) {
+  std::vector<uint16_t> a(n), b(n);
+  CK(hipMemcpy(a.data(), reference, (size_t)n * 2, hipMemcpyDeviceToHost));
+  CK(hipMemcpy(b.data(), candidate, (size_t)n * 2, hipMemcpyDeviceToHost));
+  double mx = 0, refmax = 0;
+  long diffs = 0, nonfinite = 0;
+  for (long i = 0; i < n; i++) {
+    double x = h_bf16f(a[i]), y = h_bf16f(b[i]);
+    if (!std::isfinite(x) || !std::isfinite(y)) nonfinite++;
+    mx = std::max(mx, fabs(x - y));
+    refmax = std::max(refmax, fabs(x));
+    diffs += a[i] != b[i];
+  }
+  double limit = 0.01 + 0.01 * refmax;
+  fprintf(stderr, "flash compare %s T=%d pos_base=%d maxabs=%.9g diffs=%ld n=%ld refmax=%.9g limit=%.9g nonfinite=%ld semantics=online_f32_softmax_f16_tile_probs_vs_global_bf16\n",
+          tag, T, pos_base, mx, diffs, n, refmax, limit, nonfinite);
+  if (nonfinite || mx > limit) {
+    fprintf(stderr, "flash: numeric guard failed; no token served\n");
+    exit(1);
+  }
+}
+static void flash_call(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
+                       uint16_t* O, int T, int pos_base) {
+  CK((hipError_t)chlorine_attention_flash(Q, K, V, O, T, pos_base));
+}
+static void attention(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
+                      uint16_t* O, int T, int pos_base, int layer) {
+  if (!g_flash_real_checked && layer == 3) {
+    if (T > 1024) {
+      fprintf(stderr, "flash: validate one real layer with a <=1024 prompt before a long request\n");
+      exit(1);
+    }
+    uint16_t* other = nullptr;
+    CK(hipMalloc(&other, (size_t)T * QH * HD * 2));
+    attn_tiled(Q, K, V, O, T, pos_base);
+    flash_call(Q, K, V, other, T, pos_base);
+    flash_compare(O, other, (long)T * QH * HD, "real_layer3", T, pos_base);
+    if (g_flash) CK(hipMemcpy(O, other, (size_t)T * QH * HD * 2, hipMemcpyDeviceToDevice));
+    CK(hipFree(other));
+    g_flash_real_checked = 1;
+  } else if (g_flash) {
+    flash_call(Q, K, V, O, T, pos_base);
+  } else {
+    attn_tiled(Q, K, V, O, T, pos_base);
+  }
+}
+
 // ---------------- forward ----------------
-// T tokens at positions pos_base..; logits [T][VOC] f32 in d_logits when want_logits
+// T tokens at positions pos_base..; last-token logits [VOC] in d_logits.
 static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
   g_prefill = (T > 1);
   k_embed<<<GRID1((long)T * HID), 256>>>(d_tokens, d_embed, d_x, HID);
@@ -1525,7 +1586,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_kn, kc, T, pos_base);
       k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_vv, vc, T, pos_base);
       // KV is written at pos_base+t before this. Query t attends keys 0..pos_base+t.
-      attn_tiled(d_qn, kc, vc, d_att, T, pos_base);
+      attention(d_qn, kc, vc, d_att, T, pos_base, l);
       k_fa_gate<<<GRID1((long)T * QH * HD), 256>>>(d_att, d_qg, T);
       if (fused) {
         snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l); gemv_dq(d_att, nm, d_tmp1);
@@ -1586,8 +1647,8 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     // The next token is the argmax of the last row. A full T x vocab GEMM
     // writes rows nothing reads.
     k_gemv_bf16f<<<VOC, 256>>>(d_ln1 + (long)(T - 1) * HID, d_lmhead,
-                               d_logits + (long)(T - 1) * VOC, HID);
-    if (g_bf16logits) k_bf16logits<<<GRID1((long)T * VOC), 256>>>(d_logits, (long)T * VOC);
+                               d_logits, HID);
+    if (g_bf16logits) k_bf16logits<<<GRID1(VOC), 256>>>(d_logits, VOC);
     CK(hipDeviceSynchronize());
     if (g_dbg) { printf("final:\n"); dbg_row("finalnorm", d_ln1, 0, HID); dbg_f32("logits", d_logits, 0, VOC); }
   } else {
@@ -1692,11 +1753,12 @@ static void gdn_selfcheck() {
 // with the serial kernel when the prefix is already in the cache.
 static void attn_selfcheck() {
   const int Tm = 33;
+  const int Tf = 129; // crosses both the flash query and key tile boundaries
   const int Ts = 4;
   const int ps = 5;
   const int pd = 17;
-  const int npos = Tm;
-  std::vector<uint16_t> hq((size_t)Tm * QH * HD);
+  const int npos = Tf;
+  std::vector<uint16_t> hq((size_t)Tf * QH * HD);
   std::vector<uint16_t> hk((size_t)npos * KVH * HD);
   std::vector<uint16_t> hv(hk.size());
   uint32_t rng = 7;
@@ -1734,18 +1796,31 @@ static void attn_selfcheck() {
   CK(hipDeviceSynchronize());
   attn_tiled(d_qn, d_kcache, d_vcache, d_att, Tm, 0);
   cmp(d_qg, d_att, (long)Tm * QH * HD, "matrix T=33 pos0");
+  flash_call(d_qn, d_kcache, d_vcache, d_qg, Tm, 0);
+  flash_compare(d_att, d_qg, (long)Tm * QH * HD, "synthetic", Tm, 0);
 
   k_attn_ref<<<GRID1((long)Ts * QH * HD), 256>>>(d_qn, d_kcache, d_vcache, d_qg, Ts, ps);
   CK(hipGetLastError());
   CK(hipDeviceSynchronize());
   attn_tiled(d_qn, d_kcache, d_vcache, d_att, Ts, ps);
   cmp(d_qg, d_att, (long)Ts * QH * HD, "serial T=4 pos5");
+  flash_call(d_qn, d_kcache, d_vcache, d_qg, Ts, ps);
+  flash_compare(d_att, d_qg, (long)Ts * QH * HD, "synthetic", Ts, ps);
 
   k_attn_ref<<<GRID1((long)QH * HD), 256>>>(d_qn, d_kcache, d_vcache, d_qg, 1, pd);
   CK(hipGetLastError());
   CK(hipDeviceSynchronize());
   attn_tiled(d_qn, d_kcache, d_vcache, d_att, 1, pd);
   cmp(d_qg, d_att, (long)QH * HD, "serial T=1 pos17");
+  flash_call(d_qn, d_kcache, d_vcache, d_qg, 1, pd);
+  flash_compare(d_att, d_qg, (long)QH * HD, "synthetic", 1, pd);
+
+  attn_tiled(d_qn, d_kcache, d_vcache, d_att, Tf, 0);
+  flash_call(d_qn, d_kcache, d_vcache, d_qg, Tf, 0);
+  flash_compare(d_att, d_qg, (long)Tf * QH * HD, "synthetic", Tf, 0);
+  attn_tiled(d_qn, d_kcache, d_vcache, d_att, 65, 17);
+  flash_call(d_qn, d_kcache, d_vcache, d_qg, 65, 17);
+  flash_compare(d_att, d_qg, (long)65 * QH * HD, "synthetic", 65, 17);
 
   CK(hipFree(sref));
   CK(hipFree(pref));
@@ -1755,6 +1830,14 @@ static void attn_selfcheck() {
 
 extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   if (g_ready) return 0;
+  const char* flash_env = getenv("HALO_FLASH_WMMA");
+  if (flash_env && strcmp(flash_env, "0") && strcmp(flash_env, "1")) {
+    fprintf(stderr, "HALO_FLASH_WMMA must be 0 or 1\n");
+    return -1;
+  }
+  g_flash = flash_env && !strcmp(flash_env, "1");
+  fprintf(stderr, "attention: %s (HALO_FLASH_WMMA=%d)\n",
+          g_flash ? "f16 WMMA online softmax" : "global bf16 reference", g_flash);
   if (getenv("HALO_ROPE")) ROPE_MODE = atoi(getenv("HALO_ROPE"));
   if (getenv("HALO_DEBUG")) g_dbg = 1;
   if (getenv("HALO_BF16LOG")) g_bf16logits = atoi(getenv("HALO_BF16LOG"));
@@ -1889,7 +1972,7 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_act, (long)TMAX * INTM * 2));
   CK(hipMalloc((void**)&d_scores, (long)ATTN_TILE * QH * CXT * 4));
   CK(hipMalloc((void**)&d_pbf, (long)ATTN_TILE * QH * CXT * 2));
-  CK(hipMalloc((void**)&d_logits, (long)TMAX * VOC * 4));
+  CK(hipMalloc((void**)&d_logits, (long)VOC * 4));
   CK(hipMalloc((void**)&d_tok, TMAX * 4));
   CK(hipMalloc((void**)&d_tgt, TMAX * 4));
   CK(hipMalloc((void**)&d_pred, TMAX * 4));
@@ -2004,7 +2087,7 @@ extern "C" int chlorine_trunk_generate(const int* prompt, int n_prompt, long max
 
   double td = now_s();
   int n_gen = 0, tok = 0, stop = 0;
-  k_argmax1<<<1, 256>>>(d_logits + (long)(n_prompt - 1) * VOC, d_pred, VOC);
+  k_argmax1<<<1, 256>>>(d_logits, d_pred, VOC);
   CK(hipDeviceSynchronize());
   CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
   while (!stop && n_gen < max_tokens) {
@@ -2191,11 +2274,11 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
   int n_gen = 0, tok = 0, stop = 0;
   float logp = 0.f;
   if (sample) {
-    chlorine_sample_host(d_logits + (long)(n_prompt - 1) * VOC, counts.data(),
+    chlorine_sample_host(d_logits, counts.data(),
                          (unsigned)n_prompt, opts, &tok, &logp);
     counts[tok]++;
   } else {
-    k_argmax1<<<1, 256>>>(d_logits + (long)(n_prompt - 1) * VOC, d_pred, VOC);
+    k_argmax1<<<1, 256>>>(d_logits, d_pred, VOC);
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
   }

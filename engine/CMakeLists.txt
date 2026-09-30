@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 project(chlorine LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CHLORINE_TMAX 1024 CACHE STRING "Maximum prefill rows")
+set(CHLORINE_CXT 1088 CACHE STRING "Maximum prompt plus generation positions")
 
 add_executable(chlorine
   src/main.cpp
@@ -26,8 +28,10 @@ if(HIPCC_EXECUTABLE)
   set(GEN_OBJ ${CMAKE_CURRENT_BINARY_DIR}/generator.hip.o)
   set(LT_OBJ ${CMAKE_CURRENT_BINARY_DIR}/gemm_lt.o)
   set(GDN_OBJ ${CMAKE_CURRENT_BINARY_DIR}/gdn_gpu.o)
+  set(FLASH_OBJ ${CMAKE_CURRENT_BINARY_DIR}/attn_flash.o)
   add_custom_command(OUTPUT ${GEN_OBJ}
-    COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fopenmp -fPIC -c
+    COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fopenmp -fPIC
+            -DCHLORINE_TMAX=${CHLORINE_TMAX} -DCHLORINE_CXT=${CHLORINE_CXT} -c
             ${CMAKE_CURRENT_SOURCE_DIR}/src/generator.hip -o ${GEN_OBJ}
     DEPENDS src/generator.hip
     COMMENT "hipcc generator.hip -> gfx1151")
@@ -41,7 +45,12 @@ if(HIPCC_EXECUTABLE)
             ${CMAKE_CURRENT_SOURCE_DIR}/src/gdn_gpu.hip -o ${GDN_OBJ}
     DEPENDS src/gdn_gpu.hip
     COMMENT "hipcc gdn_gpu.hip")
-  target_sources(chlorine PRIVATE ${GEN_OBJ} ${LT_OBJ} ${GDN_OBJ})
+  add_custom_command(OUTPUT ${FLASH_OBJ}
+    COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fPIC -c
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/attn_flash.hip -o ${FLASH_OBJ}
+    DEPENDS src/attn_flash.hip
+    COMMENT "hipcc causal f16 WMMA attention")
+  target_sources(chlorine PRIVATE ${GEN_OBJ} ${LT_OBJ} ${GDN_OBJ} ${FLASH_OBJ})
   if(HIP_RUNTIME)
     target_link_libraries(chlorine PRIVATE ${HIP_RUNTIME})
   endif()

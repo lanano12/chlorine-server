@@ -5700,6 +5700,8 @@ static int gdn_ensure(int T) {
   g_ut = p; p += nU;
   g_intra = p;
   g_tpad = tpad;
+  fprintf(stderr, "gdn workspace: reserved Tpad=%d bytes=%zu Q/K/V_head_stride=%ld\n",
+          g_tpad, n * sizeof(float), (long)g_tpad * GDN_DK);
   return 0;
 }
 
