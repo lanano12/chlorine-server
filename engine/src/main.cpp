@@ -38,6 +38,8 @@ int chlorine_trunk_generate2(const int* prompt, int n_prompt, long max_tokens,
                              void (*emit)(void*, int, float), void* ctx,
                              double* prefill_ms, double* decode_ms, int* stop_hit,
                              const chlorine_sample_opts* opts);
+int chlorine_trunk_ctx_cap(void);
+int chlorine_trunk_tmax(void);
 void chlorine_trunk_shutdown(void);
 }
 
@@ -193,6 +195,10 @@ int main(int argc, char** argv) {
     // stream from the checkpoint).
     if (!getenv("CHLORINE_STUB") && !g_trunk_ready && !ckpt_path.empty())
       g_trunk_ready = chlorine_trunk_init(ckpt_path.c_str()) == 0;
+    if (g_trunk_ready && !getenv("CHLORINE_STUB")) {
+      o.slot_ctx = chlorine_trunk_ctx_cap();
+      fprintf(stderr, "trunk: ctx cap %d tmax %d\n", o.slot_ctx, chlorine_trunk_tmax());
+    }
     Server svr(ckpt, o, g_trunk_ready && !getenv("CHLORINE_STUB") ? real_generate
                                                                   : stub_generate,
                nullptr);

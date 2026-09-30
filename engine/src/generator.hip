@@ -40,8 +40,15 @@ static const int   NPAIR = 32;        // rotary pairs (partial 0.25 -> 64 dims)
 static const float SCALE = 0.0625f;   // 1/sqrt(256)
 static const float THETA = 1e7f;
 static const float EPS   = 1e-6f;
-static const int   CXT   = 448;      // kv cache capacity (>= 348 u16-seq prefill + 24 decode)
-static const int   TMAX  = 352;      // activation rows (>= 348 forced-seq)
+// KV holds the prompt plus generated tokens. Activations and the logit
+// matrix are sized to TMAX, which is the longest single prefill.
+// Attention stores one query tile of scores, not QH*CXT*CXT. The cap stays
+// at 1024 rows until a 32768 prefill is measured; CXT is the KV length.
+static const int   CXT   = 1088;
+static const int   TMAX  = 1024;
+static const int   ATTN_TILE = 32; // query rows scored at once
+static_assert(TMAX <= CXT - 2, "prefill rows must fit in the KV cache with room to decode");
+static_assert(ATTN_TILE >= 1, "attention tile");
 static const char* CKPT  = "/home/ronin/Projects/chlorine-server/models/qwen3.8-27b-p1w4d-d2.hgn";
 
 static int ROPE_MODE = 0;   // 0: HF half-split pairs (p, p+32); 1: interleaved (2p, 2p+1)
@@ -151,7 +158,7 @@ static void dumpx(const uint16_t* d_x) {
   fwrite(hb, 1, 512, xf);
   free(hb);
 }
-static void gemm(const uint16_t* A, const uint16_t* W, uint16_t* C, int M, int N, int K) {
+static void gemm_scalar(const uint16_t* A, const uint16_t* W, uint16_t* C, int M, int N, int K) {
   dim3 b(16, 16);
   for (int m0 = 0; m0 < M; m0 += 96) {          // kernel supports M <= 96; chunk by m
     int mm = M - m0 < 96 ? M - m0 : 96;
@@ -159,13 +166,39 @@ static void gemm(const uint16_t* A, const uint16_t* W, uint16_t* C, int M, int N
     hipLaunchKernelGGL((k_gemm<0>), g, b, 0, 0, A + (long)m0 * K, W, C + (long)m0 * N, (float*)nullptr, mm, N, K);
   }
 }
-static void gemm_f32(const uint16_t* A, const uint16_t* W, float* Cf, int M, int N, int K) {
+static void gemm_f32_scalar(const uint16_t* A, const uint16_t* W, float* Cf, int M, int N, int K) {
   dim3 b(16, 16);
   for (int m0 = 0; m0 < M; m0 += 96) {
     int mm = M - m0 < 96 ? M - m0 : 96;
     dim3 g((N + 63) / 64);
     hipLaunchKernelGGL((k_gemm<1>), g, b, 0, 0, A + (long)m0 * K, W, (uint16_t*)nullptr, Cf + (long)m0 * N, mm, N, K);
   }
+}
+// 0 ok, -1 this shape falls back, -2 hipBLASLt unusable
+extern "C" int chlorine_gemm_lt(const void* A, const void* W, void* C, int M, int N, int K, int f32);
+static int g_blaslt = -1;
+static int use_blaslt() {
+  if (g_blaslt < 0) {
+    const char* e = getenv("HALO_BLASLT");
+    g_blaslt = (e && atoi(e) == 0) ? 0 : 1;
+  }
+  return g_blaslt;
+}
+static void gemm(const uint16_t* A, const uint16_t* W, uint16_t* C, int M, int N, int K) {
+  if (use_blaslt()) {
+    int rc = chlorine_gemm_lt(A, W, C, M, N, K, 0);
+    if (rc == 0) return;
+    if (rc == -2) g_blaslt = 0;
+  }
+  gemm_scalar(A, W, C, M, N, K);
+}
+static void gemm_f32(const uint16_t* A, const uint16_t* W, float* Cf, int M, int N, int K) {
+  if (use_blaslt()) {
+    int rc = chlorine_gemm_lt(A, W, Cf, M, N, K, 1);
+    if (rc == 0) return;
+    if (rc == -2) g_blaslt = 0;
+  }
+  gemm_f32_scalar(A, W, Cf, M, N, K);
 }
 
 // ---------------- norms ----------------
@@ -326,35 +359,95 @@ __global__ void k_attn_pv(const uint16_t* __restrict__ Pbf, const uint16_t* __re
   for (int j = 0; j <= t; j++) acc += bf16f(pb[j]) * bf16f(VC[((long)j * KVH + kvh) * HD + d]);
   O[((long)t * QH + h) * HD + d] = f32bf(acc);
 }
-__global__ void k_attn_step(const uint16_t* __restrict__ Qrow, const uint16_t* __restrict__ KC,
-                            const uint16_t* __restrict__ VC, uint16_t* __restrict__ Orow, int pos) {
-  int h = blockIdx.x; if (h >= QH) return;
-  __shared__ float sp[CXT + 1];
-  __shared__ uint16_t sb[CXT + 1];
-  int tid = threadIdx.x;
+// One query tile. Key j is an absolute KV position. Query local t attends
+// 0..pos_base+t. Scores and bf16 probs live in [head][tile row][key].
+// The dot, the max, the sum, and the value mix each walk in address order,
+// matching k_attn_scores / k_attn_softmax / k_attn_pv.
+__global__ void k_attn_scores_tile(const uint16_t* __restrict__ Q, const uint16_t* __restrict__ KC,
+                                   float* __restrict__ S, int T, int pos_base, int t0, int tile, int nkeys) {
+  long total = (long)QH * tile * nkeys;
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  int j = (int)(i % nkeys);
+  int tr = (int)((i / nkeys) % tile);
+  int h = (int)(i / ((long)nkeys * tile));
+  int t = t0 + tr;
+  if (t >= T) return;
+  int pos = pos_base + t;
+  if (j > pos) return;
   int kvh = h / (QH / KVH);
-  if (tid <= pos) {
-    const uint16_t* qp = Qrow + h * HD;
-    const uint16_t* kp = KC + ((long)tid * KVH + kvh) * HD;
+  const uint16_t* qp = Q + ((long)t * QH + h) * HD;
+  const uint16_t* kp = KC + ((long)j * KVH + kvh) * HD;
+  float s = 0.f;
+  for (int d = 0; d < HD; d++) s += bf16f(qp[d]) * bf16f(kp[d]);
+  S[((long)h * tile + tr) * nkeys + j] = s * SCALE;
+}
+__global__ void k_attn_softmax_tile(const float* __restrict__ S, uint16_t* __restrict__ Pbf,
+                                    int T, int pos_base, int t0, int tile, int nkeys) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= (long)QH * tile) return;
+  int tr = (int)(i % tile), h = (int)(i / tile);
+  int t = t0 + tr;
+  if (t >= T) return;
+  int pos = pos_base + t;
+  const float* row = S + ((long)h * tile + tr) * nkeys;
+  uint16_t* pb = Pbf + ((long)h * tile + tr) * nkeys;
+  float mx = -3.0e38f;
+  for (int j = 0; j <= pos; j++) mx = fmaxf(mx, row[j]);
+  float sum = 0.f;
+  for (int j = 0; j <= pos; j++) sum += expf(row[j] - mx);
+  float inv = 1.0f / sum;
+  for (int j = 0; j <= pos; j++) pb[j] = f32bf(expf(row[j] - mx) * inv);
+}
+__global__ void k_attn_pv_tile(const uint16_t* __restrict__ Pbf, const uint16_t* __restrict__ VC,
+                               uint16_t* __restrict__ O, int T, int pos_base, int t0, int tile, int nkeys) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= (long)tile * QH * HD) return;
+  int d = (int)(i % HD), h = (int)((i / HD) % QH), tr = (int)(i / ((long)QH * HD));
+  int t = t0 + tr;
+  if (t >= T) return;
+  int pos = pos_base + t;
+  int kvh = h / (QH / KVH);
+  const uint16_t* pb = Pbf + ((long)h * tile + tr) * nkeys;
+  float acc = 0.f;
+  for (int j = 0; j <= pos; j++) acc += bf16f(pb[j]) * bf16f(VC[((long)j * KVH + kvh) * HD + d]);
+  O[((long)t * QH + h) * HD + d] = f32bf(acc);
+}
+// Serial reference: one thread recomputes each score three times. Same device
+// expf and f32bf as the tile path, including a nonzero pos_base.
+__global__ void k_attn_ref(const uint16_t* __restrict__ Q, const uint16_t* __restrict__ KC,
+                           const uint16_t* __restrict__ VC, uint16_t* __restrict__ O,
+                           int T, int pos_base) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= (long)T * QH * HD) return;
+  int d = (int)(i % HD), h = (int)((i / HD) % QH), t = (int)(i / ((long)QH * HD));
+  int pos = pos_base + t;
+  int kvh = h / (QH / KVH);
+  const uint16_t* qp = Q + ((long)t * QH + h) * HD;
+  float mx = -3.0e38f;
+  for (int j = 0; j <= pos; j++) {
+    const uint16_t* kp = KC + ((long)j * KVH + kvh) * HD;
     float s = 0.f;
-    for (int d = 0; d < HD; d++) s += bf16f(qp[d]) * bf16f(kp[d]);
-    sp[tid] = s * SCALE;
+    for (int dd = 0; dd < HD; dd++) s += bf16f(qp[dd]) * bf16f(kp[dd]);
+    mx = fmaxf(mx, s * SCALE);
   }
-  __syncthreads();
-  if (tid == 0) {
-    float mx = -3.0e38f;
-    for (int j = 0; j <= pos; j++) mx = fmaxf(mx, sp[j]);
-    float sum = 0.f;
-    for (int j = 0; j <= pos; j++) { float e = expf(sp[j] - mx); sp[j] = e; sum += e; }
-    float inv = 1.0f / sum;
-    for (int j = 0; j <= pos; j++) sb[j] = f32bf(sp[j] * inv);
+  float sum = 0.f;
+  for (int j = 0; j <= pos; j++) {
+    const uint16_t* kp = KC + ((long)j * KVH + kvh) * HD;
+    float s = 0.f;
+    for (int dd = 0; dd < HD; dd++) s += bf16f(qp[dd]) * bf16f(kp[dd]);
+    sum += expf(s * SCALE - mx);
   }
-  __syncthreads();
-  if (tid < HD) {
-    float acc = 0.f;
-    for (int j = 0; j <= pos; j++) acc += bf16f(sb[j]) * bf16f(VC[((long)j * KVH + kvh) * HD + tid]);
-    Orow[h * HD + tid] = f32bf(acc);
+  float inv = 1.0f / sum;
+  float acc = 0.f;
+  for (int j = 0; j <= pos; j++) {
+    const uint16_t* kp = KC + ((long)j * KVH + kvh) * HD;
+    float s = 0.f;
+    for (int dd = 0; dd < HD; dd++) s += bf16f(qp[dd]) * bf16f(kp[dd]);
+    float p = bf16f(f32bf(expf(s * SCALE - mx) * inv));
+    acc += p * bf16f(VC[((long)j * KVH + kvh) * HD + d]);
   }
+  O[((long)t * QH + h) * HD + d] = f32bf(acc);
 }
 
 // ---------------- FA output gate ----------------
@@ -1012,6 +1105,11 @@ static float *d_nll;
 
 // host
 static float* h_S;            // [48][48][128][128] GDN state f32 (GDN-ordinal layer index)
+static float* d_S = nullptr; // same layout, resident across a request when HALO_GDN is on
+static int g_gdn_gpu = 0;    // 1 after the init compare accepts the device scan
+extern "C" int chlorine_gdn_gpu(const uint16_t* qkv, const float* gateG, const float* gateB,
+                                float* S, uint16_t* out, int T, int dnprep, float qscale);
+extern "C" int chlorine_gdn_reserve(int T);
 static float* h_alog;         // [48][48]
 static float* h_dtbias;       // [48][48]
 static uint16_t* h_qkvbf;     // [TMAX][10240]
@@ -1199,6 +1297,29 @@ static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float*
   }
 }
 
+// Score workspace is one query tile: [QH][tile][nkeys], nkeys <= CXT.
+static void attn_tiled(const uint16_t* Q, const uint16_t* KC, const uint16_t* VC,
+                       uint16_t* O, int T, int pos_base) {
+  if (T < 1) return;
+  for (int t0 = 0; t0 < T; t0 += ATTN_TILE) {
+    int tile = T - t0;
+    if (tile > ATTN_TILE) tile = ATTN_TILE;
+    int nkeys = pos_base + t0 + tile;
+    if (nkeys > CXT) {
+      fprintf(stderr, "attn: nkeys %d exceeds CXT %d\n", nkeys, CXT);
+      exit(1);
+    }
+    k_attn_scores_tile<<<GRID1((long)QH * tile * nkeys), 256>>>(
+        Q, KC, d_scores, T, pos_base, t0, tile, nkeys);
+    k_attn_softmax_tile<<<GRID1((long)QH * tile), 256>>>(
+        d_scores, d_pbf, T, pos_base, t0, tile, nkeys);
+    k_attn_pv_tile<<<GRID1((long)tile * QH * HD), 256>>>(
+        d_pbf, VC, O, T, pos_base, t0, tile, nkeys);
+  }
+  CK(hipGetLastError());
+  CK(hipDeviceSynchronize());
+}
+
 // ---------------- forward ----------------
 // T tokens at positions pos_base..; logits [T][VOC] f32 in d_logits when want_logits
 static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
@@ -1309,6 +1430,23 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         if (dp && l == 0) { void* hb = malloc(4096);
           CK(hipDeviceSynchronize()); CK(hipMemcpy(hb, d_qkvc, 4096, hipMemcpyDeviceToHost));
           FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 4096, f); fclose(f); free(hb); } }
+      double tscan = 0;
+      int gpu_ok = 0;
+      if (g_gdn_gpu) {
+        double ts = now_s();
+        k_gdn_gates<<<GRID1((long)T * HV), 256>>>(d_ab_a, d_ab_b, d_alog + (long)gi * HV,
+                                                  d_dtbias + (long)gi * HV, d_gateG, d_gateB, (long)T * HV);
+        int gr = chlorine_gdn_gpu(d_qkvc, d_gateG, d_gateB,
+                                  d_S + ((long)gi * HV) * DK * DV,
+                                  d_co, T, g_dnprep, h_qscale);
+        tscan = now_s() - ts;
+        if (gr == 0) gpu_ok = 1;
+        else {
+          fprintf(stderr, "gdn gpu layer %d rc %d\n", l, gr);
+          exit(1);
+        }
+      }
+      if (!gpu_ok) {
       CK(hipMemcpy(h_qkvbf, d_qkvc, (long)T * QKVW * 2, hipMemcpyDeviceToHost));
       CK(hipMemcpy(h_abbf, d_ab_a, (long)T * HV * 2, hipMemcpyDeviceToHost));
       for (long i = 0; i < (long)T * HV; i++) h_af[i] = h_bf16f(h_abbf[i]);
@@ -1329,7 +1467,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         if (dp && l == 0) { FILE* f = fopen(dp, "wb");
           fwrite(h_af, 4, 1024, f); fwrite(h_bf, 4, 1024, f); fclose(f); } }
       gdn_scan(T, h_qkvbf, h_af, h_bf, gi, h_co);
-      double tscan = now_s() - ts;
+      tscan = now_s() - ts;
       if (g_dbg) {
         double qm = 0, cm = 0, am = 0, bm = 0;
         for (long i = 0; i < (long)T * QKVW; i++) {
@@ -1350,6 +1488,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
                1.f / (1.f + expf(-h_bf[0])));
       }
       up(d_co, h_co, (long)T * HV * DV * 2);
+      }
       { const char* dp = getenv("HALO_DUMP_CO");
         if (dp && l == 0) { void* hb = malloc(2048);
           CK(hipMemcpy(hb, d_co, 2048, hipMemcpyDeviceToHost));
@@ -1385,13 +1524,8 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       uint16_t* vc = d_vcache + (long)gi * CXT * KVH * HD;
       k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_kn, kc, T, pos_base);
       k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_vv, vc, T, pos_base);
-      if (T > 1) {
-        k_attn_scores<<<GRID1((long)QH * T * T), 256>>>(d_qn, kc, d_scores, T, CXT);
-        k_attn_softmax<<<GRID1((long)QH * T), 256>>>(d_scores, d_pbf, T, CXT);
-        k_attn_pv<<<GRID1((long)T * QH * HD), 256>>>(d_pbf, vc, d_att, T, CXT);
-      } else {
-        k_attn_step<<<QH, 256>>>(d_qn, kc, vc, d_att, pos_base);
-      }
+      // KV is written at pos_base+t before this. Query t attends keys 0..pos_base+t.
+      attn_tiled(d_qn, kc, vc, d_att, T, pos_base);
       k_fa_gate<<<GRID1((long)T * QH * HD), 256>>>(d_att, d_qg, T);
       if (fused) {
         snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l); gemv_dq(d_att, nm, d_tmp1);
@@ -1449,8 +1583,10 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
   if (want_logits) {
     dumpx(d_x);
     k_rmsnorm<<<T, 256>>>(d_x, d_final_norm, d_ln1, HID, T, 1);
-    if (T == 1 && d_wpool) k_gemv_bf16f<<<VOC, 256>>>(d_ln1, d_lmhead, d_logits, HID);
-    else gemm_f32(d_ln1, d_lmhead, d_logits, T, VOC, HID);
+    // The next token is the argmax of the last row. A full T x vocab GEMM
+    // writes rows nothing reads.
+    k_gemv_bf16f<<<VOC, 256>>>(d_ln1 + (long)(T - 1) * HID, d_lmhead,
+                               d_logits + (long)(T - 1) * VOC, HID);
     if (g_bf16logits) k_bf16logits<<<GRID1((long)T * VOC), 256>>>(d_logits, (long)T * VOC);
     CK(hipDeviceSynchronize());
     if (g_dbg) { printf("final:\n"); dbg_row("finalnorm", d_ln1, 0, HID); dbg_f32("logits", d_logits, 0, VOC); }
@@ -1472,6 +1608,149 @@ static void trunk_reset_states() {
   CK(hipMemset(d_kcache, 0, (long)16 * CXT * KVH * HD * 2));
   CK(hipMemset(d_vcache, 0, (long)16 * CXT * KVH * HD * 2));
   memset(h_S, 0, (size_t)48 * HV * DK * DV * 4);
+  if (d_S) CK(hipMemset(d_S, 0, (size_t)48 * HV * DK * DV * 4));
+}
+
+static float gdn_rnd(uint32_t& rng) {
+  rng = rng * 1664525u + 1013904223u;
+  return (rng >> 8) * (1.0f / 16777216.0f);
+}
+
+// Compare the device scan with gdn_scan on synthetic tokens. Disable the
+// device path when the output or the state is far from the host recurrence.
+static void gdn_selfcheck() {
+  const char* env = getenv("HALO_GDN");
+  int force_off = env && atoi(env) == 0;
+  hipError_t ae = hipMalloc(&d_S, (size_t)48 * HV * DK * DV * 4);
+  if (ae != hipSuccess) {
+    fprintf(stderr, "gdn: d_S alloc failed (%s); host scan\n", hipGetErrorString(ae));
+    d_S = nullptr;
+    g_gdn_gpu = 0;
+    return;
+  }
+  CK(hipMemset(d_S, 0, (size_t)48 * HV * DK * DV * 4));
+  uint32_t rng = 1;
+  double worst_o = 0, worst_s = 0;
+  auto one = [&](const char* tag, int T, int dirty) {
+    for (long i = 0; i < (long)T * QKVW; i++)
+      h_qkvbf[i] = h_f32bf((gdn_rnd(rng) - 0.5f) * 0.25f);
+    for (long i = 0; i < (long)T * HV; i++) {
+      h_gateG_dev[i] = -0.03f * (0.3f + gdn_rnd(rng));
+      h_gateB_dev[i] = 0.05f + 0.8f * gdn_rnd(rng);
+    }
+    if (!dirty) {
+      memset(h_S, 0, (size_t)HV * DK * DV * 4);
+      CK(hipMemset(d_S, 0, (size_t)HV * DK * DV * 4));
+    }
+    CK(hipMemcpy(d_qkvc, h_qkvbf, (long)T * QKVW * 2, hipMemcpyHostToDevice));
+    CK(hipMemcpy(d_gateG, h_gateG_dev, (long)T * HV * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(d_gateB, h_gateB_dev, (long)T * HV * 4, hipMemcpyHostToDevice));
+    gdn_scan(T, h_qkvbf, h_af, h_bf, 0, h_co);
+    int rc = chlorine_gdn_gpu(d_qkvc, d_gateG, d_gateB, d_S, d_co, T, g_dnprep, h_qscale);
+    std::vector<uint16_t> gout((size_t)T * HV * DV);
+    std::vector<float> gs((size_t)HV * DK * DV);
+    CK(hipMemcpy(gout.data(), d_co, gout.size() * 2, hipMemcpyDeviceToHost));
+    CK(hipMemcpy(gs.data(), d_S, gs.size() * 4, hipMemcpyDeviceToHost));
+    double omax = 0, smax = 0;
+    for (size_t i = 0; i < gout.size(); i++) {
+      double d = fabs((double)h_bf16f(h_co[i]) - (double)h_bf16f(gout[i]));
+      if (d > omax) omax = d;
+    }
+    for (size_t i = 0; i < gs.size(); i++) {
+      double d = fabs((double)h_S[i] - (double)gs[i]);
+      if (d > smax) smax = d;
+    }
+    fprintf(stderr, "gdn check %s T=%d dirty=%d out_maxabs %.4g state_maxabs %.4g rc %d\n",
+            tag, T, dirty, omax, smax, rc);
+    if (rc != 0) omax = 1;
+    if (omax > worst_o) worst_o = omax;
+    if (smax > worst_s) worst_s = smax;
+  };
+  one("zero", 1, 0);
+  one("zero", 65, 0);
+  one("dirty", 65, 1);
+  memset(h_S, 0, (size_t)48 * HV * DK * DV * 4);
+  CK(hipMemset(d_S, 0, (size_t)48 * HV * DK * DV * 4));
+  int pass = worst_o <= 0.05 && worst_s <= 0.05;
+  if (force_off || !pass) {
+    g_gdn_gpu = 0;
+    fprintf(stderr, "gdn: host scan (HALO_GDN=%s out %.4g state %.4g)\n",
+            force_off ? "0" : "check", worst_o, worst_s);
+    return;
+  }
+  int rr = chlorine_gdn_reserve(TMAX);
+  if (rr != 0) {
+    g_gdn_gpu = 0;
+    fprintf(stderr, "gdn: reserve %d failed (%d); host scan\n", TMAX, rr);
+    return;
+  }
+  g_gdn_gpu = 1;
+  fprintf(stderr, "gdn: device scan on (check out %.4g state %.4g)\n", worst_o, worst_s);
+}
+
+// Bit-compare the tile path with the full-matrix kernels at pos_base 0, and
+// with the serial kernel when the prefix is already in the cache.
+static void attn_selfcheck() {
+  const int Tm = 33;
+  const int Ts = 4;
+  const int ps = 5;
+  const int pd = 17;
+  const int npos = Tm;
+  std::vector<uint16_t> hq((size_t)Tm * QH * HD);
+  std::vector<uint16_t> hk((size_t)npos * KVH * HD);
+  std::vector<uint16_t> hv(hk.size());
+  uint32_t rng = 7;
+  for (size_t i = 0; i < hq.size(); i++) hq[i] = h_f32bf(gdn_rnd(rng) * 2.f - 1.f);
+  for (size_t i = 0; i < hk.size(); i++) hk[i] = h_f32bf(gdn_rnd(rng) * 2.f - 1.f);
+  for (size_t i = 0; i < hv.size(); i++) hv[i] = h_f32bf(gdn_rnd(rng) * 2.f - 1.f);
+  CK(hipMemcpy(d_qn, hq.data(), hq.size() * 2, hipMemcpyHostToDevice));
+  CK(hipMemcpy(d_kcache, hk.data(), hk.size() * 2, hipMemcpyHostToDevice));
+  CK(hipMemcpy(d_vcache, hv.data(), hv.size() * 2, hipMemcpyHostToDevice));
+
+  auto cmp = [](const uint16_t* a, const uint16_t* b, long n, const char* tag) {
+    std::vector<uint16_t> ha(n), hb(n);
+    CK(hipMemcpy(ha.data(), a, (size_t)n * 2, hipMemcpyDeviceToHost));
+    CK(hipMemcpy(hb.data(), b, (size_t)n * 2, hipMemcpyDeviceToHost));
+    long diffs = 0;
+    double mx = 0;
+    for (long i = 0; i < n; i++) {
+      if (ha[i] == hb[i]) continue;
+      diffs++;
+      double d = fabs((double)h_bf16f(ha[i]) - (double)h_bf16f(hb[i]));
+      if (d > mx) mx = d;
+    }
+    fprintf(stderr, "attn check %s diffs %ld maxabs %.4g\n", tag, diffs, mx);
+    if (diffs) exit(1);
+  };
+
+  float* sref = nullptr;
+  uint16_t* pref = nullptr;
+  CK(hipMalloc((void**)&sref, (long)QH * Tm * Tm * 4));
+  CK(hipMalloc((void**)&pref, (long)QH * Tm * Tm * 2));
+  k_attn_scores<<<GRID1((long)QH * Tm * Tm), 256>>>(d_qn, d_kcache, sref, Tm, Tm);
+  k_attn_softmax<<<GRID1((long)QH * Tm), 256>>>(sref, pref, Tm, Tm);
+  k_attn_pv<<<GRID1((long)Tm * QH * HD), 256>>>(pref, d_vcache, d_qg, Tm, Tm);
+  CK(hipGetLastError());
+  CK(hipDeviceSynchronize());
+  attn_tiled(d_qn, d_kcache, d_vcache, d_att, Tm, 0);
+  cmp(d_qg, d_att, (long)Tm * QH * HD, "matrix T=33 pos0");
+
+  k_attn_ref<<<GRID1((long)Ts * QH * HD), 256>>>(d_qn, d_kcache, d_vcache, d_qg, Ts, ps);
+  CK(hipGetLastError());
+  CK(hipDeviceSynchronize());
+  attn_tiled(d_qn, d_kcache, d_vcache, d_att, Ts, ps);
+  cmp(d_qg, d_att, (long)Ts * QH * HD, "serial T=4 pos5");
+
+  k_attn_ref<<<GRID1((long)QH * HD), 256>>>(d_qn, d_kcache, d_vcache, d_qg, 1, pd);
+  CK(hipGetLastError());
+  CK(hipDeviceSynchronize());
+  attn_tiled(d_qn, d_kcache, d_vcache, d_att, 1, pd);
+  cmp(d_qg, d_att, (long)QH * HD, "serial T=1 pos17");
+
+  CK(hipFree(sref));
+  CK(hipFree(pref));
+  CK(hipMemset(d_kcache, 0, (long)16 * CXT * KVH * HD * 2));
+  CK(hipMemset(d_vcache, 0, (long)16 * CXT * KVH * HD * 2));
 }
 
 extern "C" int chlorine_trunk_init(const char* ckpt_path) {
@@ -1608,8 +1887,8 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_g17, (long)TMAX * INTM * 2));
   CK(hipMalloc((void**)&d_u17, (long)TMAX * INTM * 2));
   CK(hipMalloc((void**)&d_act, (long)TMAX * INTM * 2));
-  CK(hipMalloc((void**)&d_scores, (long)QH * CXT * CXT * 4));
-  CK(hipMalloc((void**)&d_pbf, (long)QH * CXT * CXT * 2));
+  CK(hipMalloc((void**)&d_scores, (long)ATTN_TILE * QH * CXT * 4));
+  CK(hipMalloc((void**)&d_pbf, (long)ATTN_TILE * QH * CXT * 2));
   CK(hipMalloc((void**)&d_logits, (long)TMAX * VOC * 4));
   CK(hipMalloc((void**)&d_tok, TMAX * 4));
   CK(hipMalloc((void**)&d_tgt, TMAX * 4));
@@ -1674,6 +1953,34 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
       fprintf(stderr, "trunk: weight pool alloc failed (%.1f GB), streaming mode\n", need / 1e9);
     }
   }
+  if (d_wpool && g_wmap.count("layers.0.mlp.gate_proj.weight") && use_blaslt()) {
+    const int M = 64;
+    std::vector<uint16_t> hin((size_t)M * HID);
+    for (int i = 0; i < (int)hin.size(); i++) hin[i] = h_f32bf(((i % 97) - 48) / 48.f);
+    CK(hipMemcpy(d_ln2, hin.data(), hin.size() * 2, hipMemcpyHostToDevice));
+    getw("layers.0.mlp.gate_proj.weight", INTM, HID, d_gate);
+    CK(hipDeviceSynchronize());
+    gemm_scalar(d_ln2, d_gate, d_g17, M, INTM, HID);
+    CK(hipDeviceSynchronize());
+    int rc = chlorine_gemm_lt(d_ln2, d_gate, d_u17, M, INTM, HID, 0);
+    CK(hipDeviceSynchronize());
+    if (rc == 0) {
+      std::vector<uint16_t> ga((size_t)M * INTM), gb((size_t)M * INTM);
+      CK(hipMemcpy(ga.data(), d_g17, ga.size() * 2, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(gb.data(), d_u17, gb.size() * 2, hipMemcpyDeviceToHost));
+      double mx = 0, ref = 0;
+      for (size_t i = 0; i < ga.size(); i++) {
+        float a = h_bf16f(ga[i]), b = h_bf16f(gb[i]);
+        mx = std::max(mx, (double)fabsf(a - b));
+        ref = std::max(ref, (double)fabsf(a));
+      }
+      fprintf(stderr, "gemm: layer0 gate scalar-vs-lt maxabs %.4g refmax %.4g\n", mx, ref);
+    } else {
+      fprintf(stderr, "gemm: layer0 gate compare skipped (%d)\n", rc);
+    }
+  }
+  attn_selfcheck();
+  gdn_selfcheck();
   g_ready = 1;
   fprintf(stderr, "trunk: ready (%.1fs)\n", now_s() - t0);
   return 0;
@@ -1687,7 +1994,7 @@ extern "C" int chlorine_trunk_generate(const int* prompt, int n_prompt, long max
                                        void (*emit)(void*, int), void* ctx,
                                        double* prefill_ms, double* decode_ms, int* stop_hit) {
   if (!g_ready) return -1;
-  if (n_prompt < 1 || n_prompt > CXT - 2 || max_tokens < 1 ||
+  if (n_prompt < 1 || n_prompt > TMAX || n_prompt > CXT - 2 || max_tokens < 1 ||
       max_tokens > (long)(CXT - n_prompt)) return -2;
   trunk_reset_states();
   double tp = now_s();
@@ -1869,7 +2176,7 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
                                         double* prefill_ms, double* decode_ms, int* stop_hit,
                                         const chlorine_sample_opts* opts) {
   if (!g_ready) return -1;
-  if (n_prompt < 1 || n_prompt > CXT - 2 || max_tokens < 1 ||
+  if (n_prompt < 1 || n_prompt > TMAX || n_prompt > CXT - 2 || max_tokens < 1 ||
       max_tokens > (long)(CXT - n_prompt)) return -2;
   bool sample = opts && opts->has_sample;
   static std::vector<int> counts;
@@ -1914,6 +2221,9 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
   *stop_hit = stop;
   return n_gen;
 }
+
+extern "C" int chlorine_trunk_ctx_cap(void) { return CXT; }
+extern "C" int chlorine_trunk_tmax(void) { return TMAX; }
 
 extern "C" void chlorine_trunk_shutdown(void) {
   // weights and buffers live for the process lifetime; nothing to do

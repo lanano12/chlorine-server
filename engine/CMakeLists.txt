@@ -22,15 +22,31 @@ if(HIPCC_EXECUTABLE)
   if(NOT OMP_RUNTIME)
     find_library(OMP_RUNTIME gomp)
   endif()
+  find_library(HIPBLASLT_LIB hipblaslt HINTS /opt/rocm/lib /opt/rocm/lib64)
   set(GEN_OBJ ${CMAKE_CURRENT_BINARY_DIR}/generator.hip.o)
+  set(LT_OBJ ${CMAKE_CURRENT_BINARY_DIR}/gemm_lt.o)
+  set(GDN_OBJ ${CMAKE_CURRENT_BINARY_DIR}/gdn_gpu.o)
   add_custom_command(OUTPUT ${GEN_OBJ}
     COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fopenmp -fPIC -c
             ${CMAKE_CURRENT_SOURCE_DIR}/src/generator.hip -o ${GEN_OBJ}
     DEPENDS src/generator.hip
     COMMENT "hipcc generator.hip -> gfx1151")
-  target_sources(chlorine PRIVATE ${GEN_OBJ})
+  add_custom_command(OUTPUT ${LT_OBJ}
+    COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fPIC -c
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/gemm_lt.cpp -o ${LT_OBJ}
+    DEPENDS src/gemm_lt.cpp
+    COMMENT "hipcc gemm_lt.cpp")
+  add_custom_command(OUTPUT ${GDN_OBJ}
+    COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -fPIC -c
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/gdn_gpu.hip -o ${GDN_OBJ}
+    DEPENDS src/gdn_gpu.hip
+    COMMENT "hipcc gdn_gpu.hip")
+  target_sources(chlorine PRIVATE ${GEN_OBJ} ${LT_OBJ} ${GDN_OBJ})
   if(HIP_RUNTIME)
     target_link_libraries(chlorine PRIVATE ${HIP_RUNTIME})
+  endif()
+  if(HIPBLASLT_LIB)
+    target_link_libraries(chlorine PRIVATE ${HIPBLASLT_LIB})
   endif()
   if(OMP_RUNTIME)
     target_link_libraries(chlorine PRIVATE ${OMP_RUNTIME})
