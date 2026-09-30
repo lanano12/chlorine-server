@@ -8,6 +8,7 @@
 //                compare vs /tmp/forced-text.bin (HFD2 dump from the original engine)
 //         dec  — prefill + 24 greedy tokens, compare vs the original's stream
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -58,29 +59,7 @@ static int ROPE_MODE = 0;   // 0: HF half-split pairs (p, p+32); 1: interleaved 
 
 static double now_s() { struct timeval tv; gettimeofday(&tv, nullptr); return tv.tv_sec + tv.tv_usec * 1e-6; }
 
-// ---------------- bf16 helpers ----------------
-__device__ inline float bf16f(uint16_t h) { uint32_t u = (uint32_t)h << 16; return __uint_as_float(u); }
-__device__ inline uint16_t f32bf(float f) {
-  uint32_t u = __float_as_uint(f);
-  uint32_t lo = u & 0xFFFFu;
-  u = (u >> 16) + (lo > 0x8000u) + ((lo == 0x8000u) & ((u >> 16) & 1u));
-  return (uint16_t)(u & 0xFFFFu);
-}
-static inline float h_bf16f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
-static inline uint16_t h_f32bf(float f) {
-  uint32_t u; memcpy(&u, &f, 4);
-  uint32_t lo = u & 0xFFFFu;
-  u = (u >> 16) + ((lo > 0x7FFFu) | ((lo == 0x7FFFu) & ((u >> 16) & 1u)));
-  return (uint16_t)(u & 0xFFFFu);
-}
-
-// ---------------- dequant (from dequant_test.hip, validated) ----------------
-__device__ inline float dequant_fp8_e4m3(uint32_t b) {
-  float s = (b & 0x80u) ? -1.0f : 1.0f;
-  uint32_t e = (b >> 3) & 0xFu, m = b & 0x7u;
-  if (e == 0) return s * (float)m * 0.125f * ldexpf(1.0f, -6);
-  return s * (1.0f + (float)m * 0.125f) * ldexpf(1.0f, (int)e - 7);
-}
+#include "dequant_common.h"
 __global__ void k_dequant_fp8r(const uint8_t* __restrict__ payload, const uint16_t* __restrict__ scales,
                                uint16_t* __restrict__ out, long cols) {
   long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
@@ -254,6 +233,59 @@ __global__ void k_add(const uint16_t* __restrict__ A, const uint16_t* __restrict
 }
 
 // ---------------- conv1d (causal, kernel 4, groups, silu) ----------------
+// conv step reading history from sti and writing the shifted history to sto
+// (sti == sto is k_conv1d_step exactly). Same arithmetic as k_conv1d_step.
+__global__ void k_conv1d_step_io(const uint16_t* __restrict__ X, const uint16_t* __restrict__ Wc,
+                                 uint16_t* __restrict__ O, const uint16_t* sti, uint16_t* sto) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= QKVW) return;
+  const uint16_t s0 = sti[c * 3 + 0], s1 = sti[c * 3 + 1], s2 = sti[c * 3 + 2];
+  float acc = fmaf(bf16f(s0), bf16f(Wc[c * 4 + 0]), 0.0f);
+  acc = fmaf(bf16f(s1), bf16f(Wc[c * 4 + 1]), acc);
+  acc = fmaf(bf16f(s2), bf16f(Wc[c * 4 + 2]), acc);
+  acc = fmaf(bf16f(X[c]), bf16f(Wc[c * 4 + 3]), acc);
+  float inv = 1.0f / (1.0f + expf(-acc));
+  O[c] = f32bf(acc * inv);
+  sto[c * 3 + 0] = s1;
+  sto[c * 3 + 1] = s2;
+  sto[c * 3 + 2] = X[c];
+}
+// per-row argmax, row r identical to k_argmax1 on that row
+__global__ void k_argmax_rows(const float* __restrict__ L, int* __restrict__ pred, int V) {
+  const float* Lr = L + (size_t)blockIdx.x * V;
+  __shared__ float smx[256]; __shared__ int smi[256];
+  int tid = threadIdx.x;
+  float mx = -3.0e38f; int mi = 0;
+  for (int v = tid; v < V; v += 256) { float x = Lr[v]; if (x > mx) { mx = x; mi = v; } }
+  smx[tid] = mx; smi[tid] = mi;
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (tid < off && smx[tid + off] > smx[tid]) { smx[tid] = smx[tid + off]; smi[tid] = smi[tid + off]; }
+    __syncthreads();
+  }
+  if (tid == 0) pred[blockIdx.x] = smi[0];
+}
+// concatenate two [T][H] bf16 row blocks into [T][2H] (MTP fc input)
+__global__ void k_concat2(const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
+                          uint16_t* __restrict__ O, long T, int H) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= T * 2 * H) return;
+  long t = i / (2 * H); int c = (int)(i % (2 * H));
+  O[i] = c < H ? A[t * H + c] : B[t * H + c - H];
+}
+// q4c variant 1 (NF4 codebook, f16 scale per 32, row-interleaved) -> bf16
+__global__ void k_dequant_q4c_v1(const float* __restrict__ cb, const uint8_t* __restrict__ rowbase,
+                                 uint16_t* __restrict__ out, long rows, long cols) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= rows * cols) return;
+  long r = i / cols, c = i % cols;
+  const uint8_t* pay = rowbase + r * (cols / 2 + cols / 16);
+  uint8_t b = pay[c >> 1];
+  int code = (c & 1) ? (b >> 4) : (b & 0xF);
+  const uint16_t* sc = (const uint16_t*)(pay + cols / 2);
+  float s = __half2float(__ushort_as_half(sc[c >> 5]));
+  out[i] = f32bf(cb[code] * s);
+}
 __global__ void k_conv1d(const uint16_t* __restrict__ X, const uint16_t* __restrict__ Wc,
                          uint16_t* __restrict__ O, long T) {
   long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
@@ -1000,52 +1032,7 @@ static void load_i4l_raw(const char* name, long rows, long cols, int slot) {
   CK(hipDeviceSynchronize());
 }
 
-// fused dequant GEMV (decode steps, M == 1): C[n] = sum_k A[k] * dequant(W[n][k]).
-// fp8r: per-thread 16-k strips, two f32 accumulators, xor-butterfly reduce, row
-// scale applied once at the end (mirrors k_gemv's structure); q4c: per-element
-// codebook*groupscale. f32 accumulate throughout, one bf16 round at the output.
-template<int Q4C>
-__global__ void k_gemv_dq(const uint16_t* __restrict__ A,
-                          const uint8_t* __restrict__ Wp,
-                          const uint16_t* __restrict__ Ws,
-                          const float* __restrict__ CB, long rowstride,
-                          uint16_t* __restrict__ C, int K) {
-  int n = blockIdx.x;
-  const uint8_t* row = Wp + (size_t)n * rowstride;
-  int tid = threadIdx.x;
-  float acc0 = 0.f, acc1 = 0.f;
-  for (int k0 = tid * 16; k0 < K; k0 += 4096) {
-    int ke = k0 + 16 > K ? K : k0 + 16;
-    for (int k = k0; k < ke; k += 2) {
-      float a0 = bf16f(A[k]), w0, a1 = 0.f, w1 = 0.f;
-      if (Q4C) {
-        uint8_t b0 = row[k >> 1];
-        w0 = CB[b0 & 0xF] * dequant_fp8_e4m3(row[(K >> 1) + (k >> 4)]);
-        if (k + 1 < K) {
-          uint8_t b1 = row[(k + 1) >> 1];
-          a1 = bf16f(A[k + 1]);
-          w1 = CB[(b1 >> 4) & 0xF] * dequant_fp8_e4m3(row[(K >> 1) + ((k + 1) >> 4)]);
-        }
-      } else {
-        w0 = dequant_fp8_e4m3(row[k]);
-        if (k + 1 < K) { a1 = bf16f(A[k + 1]); w1 = dequant_fp8_e4m3(row[k + 1]); }
-      }
-      acc0 = fmaf(a0, w0, acc0);
-      if (k + 1 < K) acc1 = fmaf(a1, w1, acc1);
-    }
-  }
-  float acc = acc0 + acc1;
-  if (!Q4C) acc *= bf16f(Ws[n]);
-  __shared__ float sh[256];
-  sh[tid] = acc;
-  __syncthreads();
-  for (int off = 128; off > 0; off >>= 1) {
-    if (tid < off) sh[tid] += sh[tid + off];
-    __syncthreads();
-  }
-  if (tid == 0) C[n] = f32bf(sh[0]);
-}
-
+#include "gemv_kernels.h"
 // tiled fp8r GEMM matching BLASLt accumulation (single per-element k-chain)
 template<int PAIR>
 __global__ void k_gemm_fp8r(const uint16_t* __restrict__ A, const uint8_t* __restrict__ Wc,
@@ -1102,44 +1089,97 @@ __global__ void k_gemm_fp8r(const uint16_t* __restrict__ A, const uint8_t* __res
   }
 }
 
-// plain bf16 GEMV with f32 output (lm_head at T == 1)
-__global__ void k_gemv_bf16f(const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
-                             float* __restrict__ C, int K) {
-  int n = blockIdx.x;
-  const uint16_t* row = W + (size_t)n * K;
-  int tid = threadIdx.x;
-  float acc0 = 0.f, acc1 = 0.f;
-  for (int k0 = tid * 16; k0 < K; k0 += 4096) {
-    int ke = k0 + 16 > K ? K : k0 + 16;
-    for (int k = k0; k < ke; k += 2) {
-      acc0 = fmaf(bf16f(A[k]), bf16f(row[k]), acc0);
-      if (k + 1 < K) acc1 = fmaf(bf16f(A[k + 1]), bf16f(row[k + 1]), acc1);
-    }
-  }
-  float acc = acc0 + acc1;
-  __shared__ float sh[256];
-  sh[tid] = acc;
-  __syncthreads();
-  for (int off = 128; off > 0; off >>= 1) {
-    if (tid < off) sh[tid] += sh[tid + off];
-    __syncthreads();
-  }
-  if (tid == 0) C[n] = sh[0];
+// HALO_GEMV_VEC=1 selects the 16-byte-load variants in gemv_kernels.h. They are
+// bit-identical to k_gemv_dq / k_gemv_bf16f (same strips, accumulators, weight
+// values and reduction tree) and are used only when K % 16 == 0 and the row
+// base is 16-byte aligned; otherwise the phase-2 kernel runs.
+static int g_gemv_vec = 0;
+static int g_ab_gemv = 0;   // HALO_AB_GEMV=1: GDN a/b gate projections by GEMV at T == 1
+static inline bool gemv_vec_ok(const void* base, long rowstride, int K) {
+  return g_gemv_vec && (K % 16) == 0 && (rowstride % 16) == 0 && (((uintptr_t)base) & 15u) == 0;
 }
-
 static bool gemv_dq(const uint16_t* A, const char* name, uint16_t* C) {  if (!d_wpool) return false;
   auto it = g_wmap.find(name);
   if (it == g_wmap.end()) return false;
   const WEnt& w = it->second;
-  if (w.dt == 5)
-    k_gemv_dq<1><<<dim3((unsigned)w.rows), 256>>>(A, d_wpool + w.off + 64, nullptr,
-                                                  (const float*)(d_wpool + w.off),
-                                                  w.cols / 2 + w.cols / 16, C, (int)w.cols);
-  else
-    k_gemv_dq<0><<<dim3((unsigned)w.rows), 256>>>(A, d_wpool + w.off,
-                                                  (const uint16_t*)(d_wpool + w.off + (size_t)w.rows * w.cols),
-                                                  nullptr, w.cols, C, (int)w.cols);
+  if (w.dt == 5) {
+    const long rs = w.cols / 2 + w.cols / 16;
+    if (gemv_vec_ok(d_wpool + w.off + 64, rs, (int)w.cols) && (((uintptr_t)A) & 15u) == 0) {
+      if (g_gemv_vec >= 2)
+        k_gemv_dq_vec<1, 1><<<dim3((unsigned)w.rows), 256>>>(A, d_wpool + w.off + 64, nullptr,
+                                                             (const float*)(d_wpool + w.off), rs, C, (int)w.cols);
+      else
+        k_gemv_dq_vec<1><<<dim3((unsigned)w.rows), 256>>>(A, d_wpool + w.off + 64, nullptr,
+                                                          (const float*)(d_wpool + w.off), rs, C, (int)w.cols);
+    } else
+      k_gemv_dq<1><<<dim3((unsigned)w.rows), 256>>>(A, d_wpool + w.off + 64, nullptr,
+                                                    (const float*)(d_wpool + w.off), rs, C, (int)w.cols);
+  } else {
+    const uint16_t* ws = (const uint16_t*)(d_wpool + w.off + (size_t)w.rows * w.cols);
+    if (gemv_vec_ok(d_wpool + w.off, w.cols, (int)w.cols) && (((uintptr_t)A) & 15u) == 0) {
+      if (g_gemv_vec >= 2)
+        k_gemv_dq_vec<0, 1><<<dim3((unsigned)w.rows), 256>>>(A, d_wpool + w.off, ws, nullptr, w.cols, C, (int)w.cols);
+      else
+        k_gemv_dq_vec<0><<<dim3((unsigned)w.rows), 256>>>(A, d_wpool + w.off, ws, nullptr, w.cols, C, (int)w.cols);
+    } else
+      k_gemv_dq<0><<<dim3((unsigned)w.rows), 256>>>(A, d_wpool + w.off, ws, nullptr, w.cols, C, (int)w.cols);
+  }
   return true;
+}
+
+// Speculative verify: forward() with g_verify = 1 processes T rows as T
+// independent decode steps at positions pos_base..pos_base+T-1. Weights are
+// streamed once for all rows (multi-row GEMVs); convolution, GDN recurrence and
+// attention run row by row with the single-token kernels, writing state into
+// the rings. Every row is bit-identical to a serial single-token step.
+static uint8_t* d_lmhead_q = nullptr;   // HALO_LMHEAD_FP8=1: raw fp8r codes [VOC][HID]
+static uint16_t* d_lmhead_s = nullptr;  // and the bf16 row scales [VOC]
+static int g_verify = 0;
+static float* d_logits_mr = nullptr;   // [8][VOC] verify logits
+static int* d_pred_mr = nullptr;       // [8]
+template<int P>
+static void gemv_dq_mr(const uint16_t* A, const WEnt& w, uint16_t* C) {
+  const int N = (int)w.rows, K = (int)w.cols;
+  if (N % 4) { fprintf(stderr, "verify: %d rows not a multiple of 4\n", N); exit(1); }
+  const bool nt = g_gemv_vec >= 2;
+  if (w.dt == 5) {
+    const long rs = w.cols / 2 + w.cols / 16;
+    if (nt) k_gemv_dq_vec_mr<1, P, 1><<<dim3((unsigned)N / 4), 256>>>(A, d_wpool + w.off + 64, nullptr, (const float*)(d_wpool + w.off), rs, C, K, N);
+    else    k_gemv_dq_vec_mr<1, P, 0><<<dim3((unsigned)N / 4), 256>>>(A, d_wpool + w.off + 64, nullptr, (const float*)(d_wpool + w.off), rs, C, K, N);
+  } else {
+    const uint16_t* ws = (const uint16_t*)(d_wpool + w.off + (size_t)w.rows * w.cols);
+    if (nt) k_gemv_dq_vec_mr<0, P, 1><<<dim3((unsigned)N / 4), 256>>>(A, d_wpool + w.off, ws, nullptr, w.cols, C, K, N);
+    else    k_gemv_dq_vec_mr<0, P, 0><<<dim3((unsigned)N / 4), 256>>>(A, d_wpool + w.off, ws, nullptr, w.cols, C, K, N);
+  }
+}
+static bool gemv_dq_rows(const uint16_t* A, int T, const char* name, uint16_t* C) {
+  if (T == 1) return gemv_dq(A, name, C);
+  auto it = g_wmap.find(name);
+  if (it == g_wmap.end()) return false;
+  const WEnt& w = it->second;
+  switch (T) {
+    case 2: gemv_dq_mr<2>(A, w, C); break;
+    case 3: gemv_dq_mr<3>(A, w, C); break;
+    case 4: gemv_dq_mr<4>(A, w, C); break;
+    case 5: gemv_dq_mr<5>(A, w, C); break;
+    case 6: gemv_dq_mr<6>(A, w, C); break;
+    case 7: gemv_dq_mr<7>(A, w, C); break;
+    case 8: gemv_dq_mr<8>(A, w, C); break;
+    default: fprintf(stderr, "verify: unsupported row count %d\n", T); exit(1);
+  }
+  return true;
+}
+static void lmhead_mr(const uint16_t* A, int T) {
+  switch (T) {
+    case 2: k_gemv_lmhead_fp8r_vec_mr<2><<<VOC, 256>>>(A, d_lmhead_q, d_lmhead_s, d_logits_mr, HID, VOC); break;
+    case 3: k_gemv_lmhead_fp8r_vec_mr<3><<<VOC, 256>>>(A, d_lmhead_q, d_lmhead_s, d_logits_mr, HID, VOC); break;
+    case 4: k_gemv_lmhead_fp8r_vec_mr<4><<<VOC, 256>>>(A, d_lmhead_q, d_lmhead_s, d_logits_mr, HID, VOC); break;
+    case 5: k_gemv_lmhead_fp8r_vec_mr<5><<<VOC, 256>>>(A, d_lmhead_q, d_lmhead_s, d_logits_mr, HID, VOC); break;
+    case 6: k_gemv_lmhead_fp8r_vec_mr<6><<<VOC, 256>>>(A, d_lmhead_q, d_lmhead_s, d_logits_mr, HID, VOC); break;
+    case 7: k_gemv_lmhead_fp8r_vec_mr<7><<<VOC, 256>>>(A, d_lmhead_q, d_lmhead_s, d_logits_mr, HID, VOC); break;
+    case 8: k_gemv_lmhead_fp8r_vec_mr<8><<<VOC, 256>>>(A, d_lmhead_q, d_lmhead_s, d_logits_mr, HID, VOC); break;
+    default: k_gemv_lmhead_fp8r_vec<<<VOC, 256>>>(A, d_lmhead_q, d_lmhead_s, d_logits_mr, HID); break;
+  }
 }
 
 // ---------------- device memory ----------------
@@ -1169,12 +1209,48 @@ static float *d_nll;
 // host
 static float* h_S;            // [48][48][128][128] GDN state f32 (GDN-ordinal layer index)
 static float* d_S = nullptr; // same layout, resident across a request when HALO_GDN is on
+// Speculative decoding keeps the GDN state and the conv history in rings of
+// NS slots. d_S / d_convstate always point at the live slot; a verify pass of
+// P rows writes the state after row r into slot live+r+1, and accepting a
+// prefix of length a moves the live slot forward by a+1. Rejected slots are
+// simply never read again. NS == 1 without speculation.
+static float* d_S_ring = nullptr;
+static uint16_t* d_conv_ring = nullptr;
+static int g_ring_ns = 1, g_ring_cur = 0;
+static const size_t kSlotS = (size_t)48 * 48 * 128 * 128;       // floats per state slot
+static const size_t kSlotConv = (size_t)48 * 10240 * 3;           // bf16 per conv slot
+static int spec_maxg() {
+  static int v = -1;
+  if (v < 0) {
+    const char* m = getenv("HALO_MTP");
+    const char* g = getenv("HALO_SPEC_MAXG");
+    v = (m && atoi(m) == 1) ? (g ? atoi(g) : 4) : 0;
+    if (v < 0) v = 0;
+    if (v > 7) v = 7;
+  }
+  return v;
+}
+static inline int ring_ns() { return spec_maxg() > 0 ? spec_maxg() + 2 : 1; }
+static inline float* ring_S(int k) { return d_S_ring + (size_t)((g_ring_cur + k) % g_ring_ns) * kSlotS; }
+static inline uint16_t* ring_conv(int k) { return d_conv_ring + (size_t)((g_ring_cur + k) % g_ring_ns) * kSlotConv; }
+static inline void ring_set(int cur) {
+  g_ring_cur = cur % g_ring_ns;
+  d_S = ring_S(0);
+  d_convstate = ring_conv(0);
+}
 static int g_gdn_gpu = 0;    // 1 after the init compare accepts the device scan
 extern "C" int chlorine_gdn_gpu(const uint16_t* qkv, const float* gateG, const float* gateB,
                                 float* S, uint16_t* out, int T, int dnprep, float qscale);
 extern "C" int chlorine_gdn_gpu_async(const uint16_t* qkv, const float* gateG, const float* gateB,
                                       float* S, uint16_t* out, int T, int dnprep, float qscale);
 extern "C" int chlorine_gdn_reserve(int T);
+extern "C" int chlorine_gdn_step_io(const uint16_t* qkv, const float* G, const float* B,
+                                    const float* Sin, float* Sout, uint16_t* out,
+                                    int dnprep, float qscale, int sync);
+extern "C" int chlorine_attention_decode_splitk(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
+                                                uint16_t* O, int pos_base);
+static int g_attn_splitk = 0;          // HALO_ATTN_SPLITK=1: flash-decoding kernel for T == 1
+static int g_splitk_real_checked = 0;
 static bool g_prefill_async = false;
 static float* h_alog;         // [48][48]
 static float* h_dtbias;       // [48][48]
@@ -1439,6 +1515,16 @@ static void attention(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
     if (g_flash) CK(hipMemcpy(O, other, (size_t)T * QH * HD * 2, hipMemcpyDeviceToDevice));
     CK(hipFree(other));
     g_flash_real_checked = 1;
+  } else if (g_flash && T == 1 && g_attn_splitk && !g_splitk_real_checked && layer == 3) {
+    // first real single-token step: guard the split-K decode kernel against the
+    // bf16 reference exactly as the prefill flash kernel is guarded
+    uint16_t* other = nullptr;
+    CK(hipMalloc(&other, (size_t)QH * HD * 2));
+    attn_tiled(Q, K, V, other, 1, pos_base);
+    CK((hipError_t)chlorine_attention_decode_splitk(Q, K, V, O, pos_base));
+    flash_compare(other, O, (long)QH * HD, "real_layer3_decode_splitk", 1, pos_base);
+    CK(hipFree(other));
+    g_splitk_real_checked = 1;
   } else if (g_flash) {
     if (g_prefill_async)
       CK((hipError_t)chlorine_attention_flash_async(Q,K,V,O,T,pos_base));
@@ -1451,11 +1537,16 @@ static void attention(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
 // ---------------- forward ----------------
 // T tokens at positions pos_base..; last-token logits [VOC] in d_logits.
 static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
-  g_prefill = (T > 1);
+  g_prefill = (T > 1 && !g_verify);
   const char* async = getenv("HALO_PREFILL_ASYNC");
+  const char* dasync = getenv("HALO_DECODE_ASYNC");
   // All kernels and hipBLASLt use the same default stream. Debug/profile and
   // host GDN retain their fences; every forward still completes at logits.
-  g_prefill_async = T > 1 && async && atoi(async) == 1 && g_gdn_gpu && !g_dbg && !getenv("HALO_TIME");
+  // HALO_DECODE_ASYNC=1 applies the same deferral to the single-token step:
+  // nothing on that path reads device memory from the host before the final
+  // logits fence, so the per-layer fences only serialize launches.
+  const bool async_ok = async && atoi(async) == 1 && g_gdn_gpu && !g_dbg && !getenv("HALO_TIME");
+  g_prefill_async = async_ok && (T > 1 || (dasync && atoi(dasync) == 1));
   k_embed<<<GRID1((long)T * HID), 256>>>(d_tokens, d_embed, d_x, HID);
   if (!g_prefill_async) CK(hipDeviceSynchronize());
   if (g_dbg) { printf("after embed:\n"); dbg_row("embed", d_x, 0, HID); }
@@ -1463,7 +1554,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     double tw = now_s();
     int fa = (l % 4 == 3);
     int gi = fa ? fa_ord(l) : gdn_ord(l);
-    bool fused = (T == 1 && d_wpool);   // decode step: fused dequant-GEMV, no dequanted W
+    bool fused = ((T == 1 || g_verify) && d_wpool);   // decode step: fused dequant-GEMV, no dequanted W
     int w4 = g_actq && T >= 64 && d_wc[0] && gate_dt5(l);
     // ---- load weights for this layer (or fused from the pool) ----
     if (fa) {
@@ -1537,22 +1628,41 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
             k_gemm_fp8r<1><<<gz, dim3(16, 16)>>>(d_ln1, d_wpool + wz->off, wzs, d_zout, T, Nz, (int)wz->cols);
           }
         } else {
-        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); gemv_dq(d_ln1, nm, d_qkvraw);
-        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   gemv_dq(d_ln1, nm, d_zout);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); gemv_dq_rows(d_ln1, T, nm, d_qkvraw);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   gemv_dq_rows(d_ln1, T, nm, d_zout);
         }
       } else {
         gemm(d_ln1, d_qkv, d_qkvraw, T, QKVW, HID);
         gemm(d_ln1, d_z, d_zout, T, HV * DV, HID);
       } }
-      if (T > 1) {
+      if (g_verify) {
+        for (int r = 0; r < T; r++)
+          k_conv1d_step_io<<<QKVW / 256, 256>>>(d_qkvraw + (long)r * QKVW, d_gdn_conv + (long)gi * QKVW * 4,
+                                                d_qkvc + (long)r * QKVW,
+                                                ring_conv(r) + (long)gi * QKVW * 3, ring_conv(r + 1) + (long)gi * QKVW * 3);
+      } else if (T > 1) {
         k_conv1d<<<GRID1((long)T * QKVW), 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc, T);
         k_conv_setstate<<<QKVW / 256, 256>>>(d_qkvraw, d_convstate + (long)gi * QKVW * 3, T);
       } else {
         k_conv1d_step<<<QKVW / 256, 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc,
                                            d_convstate + (long)gi * QKVW * 3);
       }
-      gemm(d_ln1, d_gdn_a + (long)gi * HV * HID, d_ab_a, T, HV, HID);
-      gemm(d_ln1, d_gdn_b + (long)gi * HV * HID, d_ab_b, T, HV, HID);
+      if (fused && g_ab_gemv) {
+        // HALO_AB_GEMV=1: two 48-row GEMVs instead of two hipBLASLt M=1 calls
+        for (int r = 0; r < T; r++) {
+          k_gemv_bf16_bf16out_vec<<<HV, 256>>>(d_ln1 + (long)r * HID, d_gdn_a + (long)gi * HV * HID, d_ab_a + (long)r * HV, HID);
+          k_gemv_bf16_bf16out_vec<<<HV, 256>>>(d_ln1 + (long)r * HID, d_gdn_b + (long)gi * HV * HID, d_ab_b + (long)r * HV, HID);
+        }
+      } else if (g_verify) {
+        // same M = 1 hipBLASLt call per row as the serial step
+        for (int r = 0; r < T; r++) {
+          gemm(d_ln1 + (long)r * HID, d_gdn_a + (long)gi * HV * HID, d_ab_a + (long)r * HV, 1, HV, HID);
+          gemm(d_ln1 + (long)r * HID, d_gdn_b + (long)gi * HV * HID, d_ab_b + (long)r * HV, 1, HV, HID);
+        }
+      } else {
+        gemm(d_ln1, d_gdn_a + (long)gi * HV * HID, d_ab_a, T, HV, HID);
+        gemm(d_ln1, d_gdn_b + (long)gi * HV * HID, d_ab_b, T, HV, HID);
+      }
       if (!g_prefill_async) CK(hipDeviceSynchronize());
       { const char* dp = getenv("HALO_DUMP_QKVRAW");
         if (dp && l == 0) { void* hb = malloc((long)T * QKVW * 2);
@@ -1568,9 +1678,17 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         double ts = now_s();
         k_gdn_gates<<<GRID1((long)T * HV), 256>>>(d_ab_a, d_ab_b, d_alog + (long)gi * HV,
                                                   d_dtbias + (long)gi * HV, d_gateG, d_gateB, (long)T * HV);
-        int gr = (g_prefill_async ? chlorine_gdn_gpu_async : chlorine_gdn_gpu)(d_qkvc, d_gateG, d_gateB,
+        int gr = 0;
+        if (g_verify) {
+          for (int r = 0; r < T && gr == 0; r++)
+            gr = chlorine_gdn_step_io(d_qkvc + (long)r * QKVW, d_gateG + (long)r * HV, d_gateB + (long)r * HV,
+                                      ring_S(r) + ((long)gi * HV) * DK * DV, ring_S(r + 1) + ((long)gi * HV) * DK * DV,
+                                      d_co + (long)r * HV * DV, g_dnprep, h_qscale, g_prefill_async ? 0 : 1);
+        } else {
+          gr = (g_prefill_async ? chlorine_gdn_gpu_async : chlorine_gdn_gpu)(d_qkvc, d_gateG, d_gateB,
                                   d_S + ((long)gi * HV) * DK * DV,
                                   d_co, T, g_dnprep, h_qscale);
+        }
         tscan = now_s() - ts;
         if (gr == 0) gpu_ok = 1;
         else {
@@ -1631,7 +1749,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
           CK(hipMemcpy(hb2, d_gn, 2048, hipMemcpyDeviceToHost));
           FILE* f = fopen(gp, "wb"); fwrite(hb2, 1, 2048, f); fclose(f); free(hb2); } }
       if (fused) {
-        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l); gemv_dq(d_gn, nm, d_tmp1);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l); gemv_dq_rows(d_gn, T, nm, d_tmp1);
       } else {
         gemm(d_gn, d_outp, d_tmp1, T, HID, HV * DV);
       }
@@ -1640,9 +1758,9 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     } else {
       // ---- FA branch ----
       if (fused) {
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l);  gemv_dq(d_ln1, nm, d_qg);
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l);  gemv_dq(d_ln1, nm, d_kk);
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l);  gemv_dq(d_ln1, nm, d_vv);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l);  gemv_dq_rows(d_ln1, T, nm, d_qg);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l);  gemv_dq_rows(d_ln1, T, nm, d_kk);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l);  gemv_dq_rows(d_ln1, T, nm, d_vv);
       } else {
         gemm(d_ln1, d_q, d_qg, T, QH * HD * 2, HID);
         gemm(d_ln1, d_k, d_kk, T, KVH * HD, HID);
@@ -1657,10 +1775,15 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_kn, kc, T, pos_base);
       k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_vv, vc, T, pos_base);
       // KV is written at pos_base+t before this. Query t attends keys 0..pos_base+t.
-      attention(d_qn, kc, vc, d_att, T, pos_base, l);
+      if (g_verify) {
+        for (int r = 0; r < T; r++)
+          attention(d_qn + (long)r * QH * HD, kc, vc, d_att + (long)r * QH * HD, 1, pos_base + r, l);
+      } else {
+        attention(d_qn, kc, vc, d_att, T, pos_base, l);
+      }
       k_fa_gate<<<GRID1((long)T * QH * HD), 256>>>(d_att, d_qg, T);
       if (fused) {
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l); gemv_dq(d_att, nm, d_tmp1);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l); gemv_dq_rows(d_att, T, nm, d_tmp1);
       } else {
         gemm(d_att, d_o, d_tmp1, T, HID, QH * HD);
       }
@@ -1690,8 +1813,8 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
           CK(hipMemcpy(hb2, d_qs, 4096, hipMemcpyDeviceToHost));
           f = fopen("/tmp/ours_qs.bin", "wb"); fwrite(hb2, 1, 4096, f); fclose(f); free(hb2); } }
     } else if (fused) {
-      snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); gemv_dq(d_ln2, nm, d_g17);
-      snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   gemv_dq(d_ln2, nm, d_u17);
+      snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); gemv_dq_rows(d_ln2, T, nm, d_g17);
+      snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   gemv_dq_rows(d_ln2, T, nm, d_u17);
     } else {
       gemm(d_ln2, d_gate, d_g17, T, INTM, HID);
       gemm(d_ln2, d_up, d_u17, T, INTM, HID);
@@ -1702,7 +1825,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       k_actq_emit<<<dim3(T, INTM / 256), 256>>>(d_act, d_qc, d_qs, INTM);
       k_gemm_i4emul<<<dim3(T, HID / 256), 256>>>(d_qc, d_qs, d_wc[2], d_ws[2], d_tmp1, HID, INTM);
     } else if (fused) {
-      snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); gemv_dq(d_act, nm, d_tmp1);
+      snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); gemv_dq_rows(d_act, T, nm, d_tmp1);
     } else {
       gemm(d_act, d_down, d_tmp1, T, HID, INTM);
     }
@@ -1717,13 +1840,197 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     k_rmsnorm<<<T, 256>>>(d_x, d_final_norm, d_ln1, HID, T, 1);
     // The next token is the argmax of the last row. A full T x vocab GEMM
     // writes rows nothing reads.
-    k_gemv_bf16f<<<VOC, 256>>>(d_ln1 + (long)(T - 1) * HID, d_lmhead,
-                               d_logits, HID);
+    if (g_verify) {
+      lmhead_mr(d_ln1, T);
+    } else if (d_lmhead_q) {
+      // HALO_LMHEAD_FP8=1: the stored fp8r plane (1.27 GB) instead of the bf16
+      // copy (2.54 GB); each weight is rounded to bf16 exactly as k_dequant_fp8r
+      // did, so the logits are bit-identical to the bf16-copy path.
+      k_gemv_lmhead_fp8r_vec<<<VOC, 256>>>(d_ln1 + (long)(T - 1) * HID, d_lmhead_q, d_lmhead_s,
+                                           d_logits, HID);
+    } else if (g_gemv_vec) {
+      k_gemv_bf16f_vec<<<VOC, 256>>>(d_ln1 + (long)(T - 1) * HID, d_lmhead, d_logits, HID);
+    } else {
+      k_gemv_bf16f<<<VOC, 256>>>(d_ln1 + (long)(T - 1) * HID, d_lmhead,
+                                 d_logits, HID);
+    }
     if (g_bf16logits) k_bf16logits<<<GRID1(VOC), 256>>>(d_logits, VOC);
     CK(hipDeviceSynchronize());
     if (g_dbg) { printf("final:\n"); dbg_row("finalnorm", d_ln1, 0, HID); dbg_f32("logits", d_logits, 0, VOC); }
   } else {
     CK(hipDeviceSynchronize());
+  }
+}
+
+
+// ================= MTP drafter (drafter 1) =================
+// Qwen3-Next style multi-token-prediction head: fc([norm_e(embed(t)) ;
+// norm_h(h)]) -> one gated full-attention layer + SwiGLU -> final norm ->
+// shared lm_head. h is the trunk's final-normed hidden at the previous
+// position; the MTP layer has its own KV cache indexed by position. Weights
+// (q4c variant 1, NF4) are dequantized to bf16 once at init. The drafter only
+// proposes tokens; the trunk verifies every one, so its numerics never change
+// the output.
+static int g_mtp_ok = 0;
+static uint16_t *d_mw_fc, *d_mw_q, *d_mw_k, *d_mw_v, *d_mw_o, *d_mw_g, *d_mw_u, *d_mw_d;
+// HALO_MTP_Q4=1: the drafter's single-row steps read the stored NF4 blobs
+struct MtpQ4 { uint8_t* blob = nullptr; long rows = 0, cols = 0; };
+static MtpQ4 g_mq_q, g_mq_k, g_mq_v, g_mq_o, g_mq_g, g_mq_u, g_mq_d;
+static int g_mtp_q4 = 0;
+static uint16_t *d_mn_e, *d_mn_h, *d_mn_in, *d_mn_post, *d_mn_q, *d_mn_k, *d_mn_final;
+static uint16_t *d_mkc, *d_mvc;          // MTP KV cache [CXT][KVH][HD]
+static uint16_t *d_mtp_hin;              // [TMAX][HID] trunk hidden rows fed to the MTP layer
+static uint16_t *d_mtp_hout;             // [HID] MTP output hidden of the last drafted row
+static uint16_t *d_hlast;                // [HID] trunk hidden of the last processed position
+static int *d_mtp_ids;                   // [TMAX]
+static int *d_draft_map = nullptr;       // draft vocabulary (sorted trunk ids) or null
+static int g_draft_nv = 0;
+static float *d_draft_prob = nullptr;    // drafter confidence of the last draft
+
+static uint16_t* mtp_load_bf16(const char* name, long n) {
+  const Ent* e = find(name);
+  if (!e || e->dt != 0 || e->size != n * 2) { fprintf(stderr, "mtp: %s missing or not bf16\n", name); return nullptr; }
+  uint16_t* d = nullptr;
+  CK(hipMalloc((void**)&d, n * 2));
+  long chunk = 32 << 20;
+  for (long o = 0; o < n * 2; o += chunk) {
+    long nb = chunk < n * 2 - o ? chunk : n * 2 - o;
+    rd(e->off + o, h_stage, nb); up((uint8_t*)d + o, h_stage, nb);
+  }
+  return d;
+}
+static void mtp_keep_q4(const char* name, long rows, long cols, MtpQ4& q) {
+  const Ent* te = find(name);
+  CK(hipMalloc((void**)&q.blob, te->size));
+  long chunk = 32 << 20;
+  for (long o = 0; o < te->size; o += chunk) {
+    long nb = chunk < te->size - o ? chunk : te->size - o;
+    rd(te->off + o, h_stage, nb); up(q.blob + o, h_stage, nb);
+  }
+  q.rows = rows; q.cols = cols;
+}
+static uint16_t* mtp_load_q4c1(const char* name, long rows, long cols) {
+  const Ent* e = find(name);
+  const long per = cols / 2 + cols / 16;
+  if (!e || e->dt != 5 || e->size != 64 + rows * per) { fprintf(stderr, "mtp: %s missing or not q4c\n", name); return nullptr; }
+  uint16_t* d = nullptr;
+  CK(hipMalloc((void**)&d, (size_t)rows * cols * 2));
+  float* cb = nullptr; CK(hipMalloc((void**)&cb, 64));
+  rd(e->off, h_stage, 64); up(cb, h_stage, 64);
+  uint8_t* raw = nullptr; const long chunkrows = (long)((48L << 20) / per);
+  CK(hipMalloc((void**)&raw, (size_t)chunkrows * per));
+  for (long r0 = 0; r0 < rows; r0 += chunkrows) {
+    long nr = chunkrows < rows - r0 ? chunkrows : rows - r0;
+    rd(e->off + 64 + r0 * per, h_stage, (size_t)nr * per); up(raw, h_stage, (size_t)nr * per);
+    k_dequant_q4c_v1<<<GRID1(nr * cols), 256>>>(cb, raw, d + r0 * cols, nr, cols);
+    CK(hipDeviceSynchronize());
+  }
+  CK(hipFree(raw)); CK(hipFree(cb));
+  return d;
+}
+static void mtp_load() {
+  if (!find("mtp.fc.weight")) { fprintf(stderr, "mtp: checkpoint has no MTP head\n"); return; }
+  if (!d_lmhead_q || !g_gemv_vec || !g_gdn_gpu) {
+    fprintf(stderr, "mtp: speculation needs HALO_LMHEAD_FP8=1, HALO_GEMV_VEC>=1 and the device GDN scan; drafter disabled\n");
+    return;
+  }
+  double t0 = now_s();
+  d_mw_fc = mtp_load_bf16("mtp.fc.weight", (long)HID * 2 * HID);
+  d_mn_e = mtp_load_bf16("mtp.pre_fc_norm_embedding.weight", HID);
+  d_mn_h = mtp_load_bf16("mtp.pre_fc_norm_hidden.weight", HID);
+  d_mn_final = mtp_load_bf16("mtp.norm.weight", HID);
+  d_mn_in = mtp_load_bf16("mtp.layers.0.input_layernorm.weight", HID);
+  d_mn_post = mtp_load_bf16("mtp.layers.0.post_attention_layernorm.weight", HID);
+  d_mn_q = mtp_load_bf16("mtp.layers.0.self_attn.q_norm.weight", HD);
+  d_mn_k = mtp_load_bf16("mtp.layers.0.self_attn.k_norm.weight", HD);
+  d_mw_q = mtp_load_q4c1("mtp.layers.0.self_attn.q_proj.weight", QH * HD * 2, HID);
+  d_mw_k = mtp_load_q4c1("mtp.layers.0.self_attn.k_proj.weight", KVH * HD, HID);
+  d_mw_v = mtp_load_q4c1("mtp.layers.0.self_attn.v_proj.weight", KVH * HD, HID);
+  d_mw_o = mtp_load_q4c1("mtp.layers.0.self_attn.o_proj.weight", HID, QH * HD);
+  d_mw_g = mtp_load_q4c1("mtp.layers.0.mlp.gate_proj.weight", INTM, HID);
+  d_mw_u = mtp_load_q4c1("mtp.layers.0.mlp.up_proj.weight", INTM, HID);
+  d_mw_d = mtp_load_q4c1("mtp.layers.0.mlp.down_proj.weight", HID, INTM);
+  if (!d_mw_fc || !d_mn_e || !d_mn_h || !d_mn_final || !d_mn_in || !d_mn_post || !d_mn_q || !d_mn_k ||
+      !d_mw_q || !d_mw_k || !d_mw_v || !d_mw_o || !d_mw_g || !d_mw_u || !d_mw_d) return;
+  { const char* q4 = getenv("HALO_MTP_Q4");
+    if (q4 && atoi(q4) == 1) {
+      mtp_keep_q4("mtp.layers.0.self_attn.q_proj.weight", QH * HD * 2, HID, g_mq_q);
+      mtp_keep_q4("mtp.layers.0.self_attn.k_proj.weight", KVH * HD, HID, g_mq_k);
+      mtp_keep_q4("mtp.layers.0.self_attn.v_proj.weight", KVH * HD, HID, g_mq_v);
+      mtp_keep_q4("mtp.layers.0.self_attn.o_proj.weight", HID, QH * HD, g_mq_o);
+      mtp_keep_q4("mtp.layers.0.mlp.gate_proj.weight", INTM, HID, g_mq_g);
+      mtp_keep_q4("mtp.layers.0.mlp.up_proj.weight", INTM, HID, g_mq_u);
+      mtp_keep_q4("mtp.layers.0.mlp.down_proj.weight", HID, INTM, g_mq_d);
+      g_mtp_q4 = 1;
+    } }
+  CK(hipMalloc((void**)&d_mkc, (size_t)CXT * KVH * HD * 2));
+  CK(hipMalloc((void**)&d_mvc, (size_t)CXT * KVH * HD * 2));
+  CK(hipMalloc((void**)&d_mtp_hin, (size_t)TMAX * HID * 2));
+  CK(hipMalloc((void**)&d_mtp_hout, (size_t)HID * 2));
+  CK(hipMalloc((void**)&d_hlast, (size_t)HID * 2));
+  CK(hipMalloc((void**)&d_mtp_ids, (size_t)TMAX * 4));
+  CK(hipMalloc((void**)&d_draft_prob, 4));
+  { const char* ev = getenv("HALO_MTP_VOCAB");
+    const Ent* dm = find("draft_vocab_map");
+    if (ev && atoi(ev) == 1 && dm && dm->dt == 3) {
+      g_draft_nv = (int)(dm->size / 4);
+      CK(hipMalloc((void**)&d_draft_map, dm->size));
+      rd(dm->off, h_stage, dm->size); up(d_draft_map, h_stage, dm->size);
+      fprintf(stderr, "mtp: draft argmax over the %d-token draft vocabulary\n", g_draft_nv);
+    } }
+  g_mtp_ok = 1;
+  fprintf(stderr, "mtp: drafter loaded (bf16 layer %.2f GB, %.1fs), max draft %d, state ring %d slots\n",
+          (double)(2L * HID * 2 * HID + 2L * (QH * HD * 2 + 2 * KVH * HD) * HID + 2L * HID * QH * HD + 6L * INTM * HID) / 1e9,
+          now_s() - t0, spec_maxg(), g_ring_ns);
+}
+// y[T][N] = x[T][K] . W[N][K]^T with bf16 weights: GEMV for one row, hipBLASLt otherwise
+static void mproj(const uint16_t* A, const uint16_t* W, uint16_t* C, int T, int N, int K,
+                  const MtpQ4* q = nullptr) {
+  if (T == 1 && q && q->blob)
+    k_gemv_q4c1_vec<<<N, 256>>>(A, q->blob + 64, (const float*)q->blob, (long)(K / 2 + K / 16), C, K);
+  else if (T == 1) k_gemv_bf16_bf16out_vec<<<N, 256>>>(A, W, C, K);
+  else gemm(A, W, C, T, N, K);
+}
+// MTP forward over T rows: row t combines trunk hidden h[t] with token ids[t]
+// at position pos0 + t and writes the MTP KV entry for that position. With
+// want_logits the last row's logits go to d_logits and its argmax to d_pred.
+// Leaves the final-normed MTP hidden of the last row in d_mtp_hout.
+static void mtp_rows(const uint16_t* h, const int* ids, int T, int pos0, bool want_logits) {
+  k_embed<<<GRID1((long)T * HID), 256>>>(ids, d_embed, d_x, HID);
+  k_rmsnorm<<<T, 256>>>(d_x, d_mn_e, d_ln2, HID, T, 1);
+  k_rmsnorm<<<T, 256>>>(h, d_mn_h, d_tmp1, HID, T, 1);
+  k_concat2<<<GRID1((long)T * 2 * HID), 256>>>(d_ln2, d_tmp1, d_qkvraw, T, HID);
+  mproj(d_qkvraw, d_mw_fc, d_x, T, HID, 2 * HID);
+  k_rmsnorm<<<T, 256>>>(d_x, d_mn_in, d_ln1, HID, T, 1);
+  mproj(d_ln1, d_mw_q, d_qg, T, QH * HD * 2, HID, &g_mq_q);
+  mproj(d_ln1, d_mw_k, d_kk, T, KVH * HD, HID, &g_mq_k);
+  mproj(d_ln1, d_mw_v, d_vv, T, KVH * HD, HID, &g_mq_v);
+  k_headnorm<<<GRID1((long)T * QH), 256>>>(d_qg, d_mn_q, d_qn, T, QH, QH * HD * 2, HD * 2, HD);
+  k_headnorm<<<GRID1((long)T * KVH), 256>>>(d_kk, d_mn_k, d_kn, T, KVH, KVH * HD, HD, HD);
+  k_rope<<<GRID1((long)T * QH * NPAIR), 256>>>(d_qn, T, QH, pos0, ROPE_MODE);
+  k_rope<<<GRID1((long)T * KVH * NPAIR), 256>>>(d_kn, T, KVH, pos0, ROPE_MODE);
+  k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_kn, d_mkc, T, pos0);
+  k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_vv, d_mvc, T, pos0);
+  if (T == 1) CK((hipError_t)chlorine_attention_decode_splitk(d_qn, d_mkc, d_mvc, d_att, pos0));
+  else CK((hipError_t)chlorine_attention_flash(d_qn, d_mkc, d_mvc, d_att, T, pos0));
+  k_fa_gate<<<GRID1((long)T * QH * HD), 256>>>(d_att, d_qg, T);
+  mproj(d_att, d_mw_o, d_tmp1, T, HID, QH * HD, &g_mq_o);
+  k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
+  k_rmsnorm<<<T, 256>>>(d_x, d_mn_post, d_ln2, HID, T, 1);
+  mproj(d_ln2, d_mw_g, d_g17, T, INTM, HID, &g_mq_g);
+  mproj(d_ln2, d_mw_u, d_u17, T, INTM, HID, &g_mq_u);
+  k_silu_mul<<<GRID1((long)T * INTM), 256>>>(d_g17, d_u17, d_act, (long)T * INTM);
+  mproj(d_act, d_mw_d, d_tmp1, T, HID, INTM, &g_mq_d);
+  k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
+  k_rmsnorm<<<1, 256>>>(d_x + (long)(T - 1) * HID, d_mn_final, d_mtp_hout, HID, 1, 1);
+  if (want_logits) {
+    if (d_draft_map) {
+      k_gemv_lmhead_fp8r_vec_map<<<g_draft_nv, 256>>>(d_mtp_hout, d_lmhead_q, d_lmhead_s, d_draft_map, d_logits, HID);
+      k_argmax_prob<<<1, 256>>>(d_logits, g_draft_nv, d_draft_map, d_pred, d_draft_prob);
+    } else {
+      k_gemv_lmhead_fp8r_vec<<<VOC, 256>>>(d_mtp_hout, d_lmhead_q, d_lmhead_s, d_logits, HID);
+      k_argmax_prob<<<1, 256>>>(d_logits, VOC, nullptr, d_pred, d_draft_prob);
+    }
   }
 }
 
@@ -1736,6 +2043,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
 static int g_ready = 0;
 
 static void trunk_reset_states() {
+  if (d_S_ring && d_conv_ring) ring_set(0);
   CK(hipMemset(d_convstate, 0, (long)48 * QKVW * 3 * 2));
   CK(hipMemset(d_kcache, 0, (long)16 * CXT * KVH * HD * 2));
   CK(hipMemset(d_vcache, 0, (long)16 * CXT * KVH * HD * 2));
@@ -1753,10 +2061,12 @@ static float gdn_rnd(uint32_t& rng) {
 static void gdn_selfcheck() {
   const char* env = getenv("HALO_GDN");
   int force_off = env && atoi(env) == 0;
-  hipError_t ae = hipMalloc(&d_S, (size_t)48 * HV * DK * DV * 4);
+  g_ring_ns = ring_ns();
+  hipError_t ae = hipMalloc(&d_S_ring, (size_t)g_ring_ns * 48 * HV * DK * DV * 4);
+  d_S = d_S_ring;
   if (ae != hipSuccess) {
     fprintf(stderr, "gdn: d_S alloc failed (%s); host scan\n", hipGetErrorString(ae));
-    d_S = nullptr;
+    d_S = nullptr; d_S_ring = nullptr;
     g_gdn_gpu = 0;
     return;
   }
@@ -1888,6 +2198,10 @@ static void attn_selfcheck() {
   cmp(d_qg, d_att, (long)QH * HD, "serial T=1 pos17");
   flash_call(d_qn, d_kcache, d_vcache, d_qg, 1, pd);
   flash_compare(d_att, d_qg, (long)QH * HD, "synthetic", 1, pd);
+  if (g_attn_splitk && g_flash) {
+    CK((hipError_t)chlorine_attention_decode_splitk(d_qn, d_kcache, d_vcache, d_qg, pd));
+    flash_compare(d_att, d_qg, (long)QH * HD, "synthetic-splitk", 1, pd);
+  }
 
   attn_tiled(d_qn, d_kcache, d_vcache, d_att, Tf, 0);
   flash_call(d_qn, d_kcache, d_vcache, d_qg, Tf, 0);
@@ -1916,6 +2230,9 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   if (getenv("HALO_DEBUG")) g_dbg = 1;
   if (getenv("HALO_BF16LOG")) g_bf16logits = atoi(getenv("HALO_BF16LOG"));
   if (getenv("HALO_ACTQ")) g_actq = atoi(getenv("HALO_ACTQ"));
+  if (getenv("HALO_GEMV_VEC")) g_gemv_vec = atoi(getenv("HALO_GEMV_VEC"));
+  if (getenv("HALO_ATTN_SPLITK")) g_attn_splitk = atoi(getenv("HALO_ATTN_SPLITK"));
+  if (getenv("HALO_AB_GEMV")) g_ab_gemv = atoi(getenv("HALO_AB_GEMV"));
   if (getenv("HALO_DNPREP")) g_dnprep = atoi(getenv("HALO_DNPREP"));
   if (getenv("HALO_BETA32")) g_beta32 = atoi(getenv("HALO_BETA32"));
 
@@ -1938,9 +2255,26 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_embed, (long)VOC * HID * 2));
   fprintf(stderr, "trunk: loading embed...\n");
   load_bf16("embed_tokens.weight", (long)VOC * HID * 2, d_embed);
-  CK(hipMalloc((void**)&d_lmhead, (long)VOC * HID * 2));
-  fprintf(stderr, "trunk: loading lm_head (fp8r dequant)...\n");
-  load_fp8r("lm_head.weight", VOC, HID, d_lmhead);
+  { const char* lq = getenv("HALO_LMHEAD_FP8");
+    if (lq && atoi(lq) == 1 && find("lm_head.weight") && find("lm_head.weight")->dt == 6) {
+      // keep the stored fp8r plane; no bf16 copy of lm_head is made
+      const Ent* e = find("lm_head.weight");
+      CK(hipMalloc((void**)&d_lmhead_q, (size_t)VOC * HID));
+      CK(hipMalloc((void**)&d_lmhead_s, (size_t)VOC * 2));
+      long chunk = 32 << 20;
+      for (long o = 0; o < (long)VOC * HID; o += chunk) {
+        long nb = chunk < (long)VOC * HID - o ? chunk : (long)VOC * HID - o;
+        rd(e->off + o, h_stage, nb); up(d_lmhead_q + o, h_stage, nb);
+      }
+      rd(e->off + (long)VOC * HID, h_stage, (size_t)VOC * 2); up(d_lmhead_s, h_stage, (size_t)VOC * 2);
+      d_lmhead = nullptr;
+      printf("lm_head: fp8r plane resident (%.2f GB), no bf16 copy\n", (double)VOC * HID / 1e9);
+    } else {
+      CK(hipMalloc((void**)&d_lmhead, (long)VOC * HID * 2));
+      fprintf(stderr, "trunk: loading lm_head (fp8r dequant)...\n");
+      load_fp8r("lm_head.weight", VOC, HID, d_lmhead);
+    }
+  }
   CK(hipDeviceSynchronize());
   fprintf(stderr, "trunk: big tensors loaded (%.1fs)\n", now_s() - t0);
 
@@ -2016,7 +2350,8 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_qc, (long)TMAX * INTM / 2 + 1024));
   CK(hipMalloc((void**)&d_qs, (long)TMAX * (INTM / 256) * 2 + 1024));
 
-  CK(hipMalloc((void**)&d_convstate, (long)48 * QKVW * 3 * 2));
+  CK(hipMalloc((void**)&d_conv_ring, (size_t)ring_ns() * kSlotConv * 2));
+  d_convstate = d_conv_ring;
   CK(hipMemset(d_convstate, 0, (long)48 * QKVW * 3 * 2));
   CK(hipMalloc((void**)&d_kcache, (long)16 * CXT * KVH * HD * 2));
   CK(hipMalloc((void**)&d_vcache, (long)16 * CXT * KVH * HD * 2));
@@ -2047,6 +2382,8 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_scores, (long)ATTN_TILE * QH * CXT * 4));
   CK(hipMalloc((void**)&d_pbf, (long)ATTN_TILE * QH * CXT * 2));
   CK(hipMalloc((void**)&d_logits, (long)VOC * 4));
+  CK(hipMalloc((void**)&d_logits_mr, (long)8 * VOC * 4));
+  CK(hipMalloc((void**)&d_pred_mr, 64));
   CK(hipMalloc((void**)&d_tok, TMAX * 4));
   CK(hipMalloc((void**)&d_tgt, TMAX * 4));
   CK(hipMalloc((void**)&d_pred, TMAX * 4));
@@ -2139,6 +2476,7 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   attn_selfcheck();
   gdn_selfcheck();
   init_bf16_weight_cache();
+  if (spec_maxg() > 0) mtp_load();
   g_ready = 1;
   fprintf(stderr, "trunk: ready (%.1fs)\n", now_s() - t0);
   return 0;
@@ -2328,25 +2666,50 @@ extern "C" int chlorine_sample_host(const float* d_row, int* counts, unsigned in
 // sampler (temp/top-k/top-p/min-p/seed, presence/frequency penalties, bias,
 // logprobs). posctr for the counter RNG = n_prompt + generated-so-far (the
 // engine passes base + loop index; first token = n_prompt).
-extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long max_tokens,
+// HALO_LOGIT_HASH=1 prints an FNV-1a hash of the full f32 logits row that
+// decided each committed token ("LH <position> <hash>"). A speculative run and
+// a serial run of the same prompt must print identical lines: that is the
+// bit-identity test of the verify path.
+static int g_logit_hash = -1;
+static void logit_hash(const float* d_row, int pos) {
+  if (g_logit_hash < 0) { const char* e = getenv("HALO_LOGIT_HASH"); g_logit_hash = e && atoi(e) == 1; }
+  if (!g_logit_hash) return;
+  static std::vector<uint32_t> h;
+  h.resize(VOC);
+  CK(hipDeviceSynchronize());
+  CK(hipMemcpy(h.data(), d_row, (size_t)VOC * 4, hipMemcpyDeviceToHost));
+  uint64_t x = 1469598103934665603ull;
+  for (int i = 0; i < VOC; i++) { x ^= h[i]; x *= 1099511628211ull; }
+  fprintf(stderr, "LH %d %016llx\n", pos, (unsigned long long)x);
+}
+
+struct chlorine_spec_stats {
+  int drafter, rounds, proposed, accepted, committed;
+  double draft_ms, verify_ms, ingest_ms, mtp_prefill_ms;
+};
+
+extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long max_tokens,
                                         const int* eos, int n_eos,
                                         void (*emit)(void*, int, float), void* ctx,
                                         double* prefill_ms, double* decode_ms, int* stop_hit,
-                                        const chlorine_sample_opts* opts) {
+                                        const chlorine_sample_opts* opts, int drafter,
+                                        chlorine_spec_stats* st) {
   if (!g_ready) return -1;
   if (n_prompt < 1 || n_prompt > TMAX || n_prompt > CXT - 2 || max_tokens < 1 ||
       max_tokens > (long)(CXT - n_prompt)) return -2;
   bool sample = opts && opts->has_sample;
+  const bool spec = drafter == 1 && g_mtp_ok && !sample;
+  chlorine_spec_stats local{};
+  if (!st) st = &local;
+  *st = chlorine_spec_stats{};
+  st->drafter = spec ? 1 : 0;
   static std::vector<int> counts;
   counts.assign(VOC, 0);
   trunk_reset_states();
   double tp = now_s();
   up(d_tok, prompt, (size_t)n_prompt * 4);
   forward(d_tok, n_prompt, 0, 1);
-  *prefill_ms = (now_s() - tp) * 1000.0;
-
-  double td = now_s();
-  int n_gen = 0, tok = 0, stop = 0;
+  int tok = 0;
   float logp = 0.f;
   if (sample) {
     chlorine_sample_host(d_logits, counts.data(),
@@ -2356,28 +2719,137 @@ extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long ma
     k_argmax1<<<1, 256>>>(d_logits, d_pred, VOC);
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
+    logit_hash(d_logits, n_prompt - 1);
   }
-  while (!stop && n_gen < max_tokens) {
-    emit(ctx, tok, sample ? logp : 0.f);
+  if (spec) {
+    // MTP prompt ingest: position q (1..n-1) combines trunk hidden h[q-1]
+    // with token q. The trunk's final norm left all prompt rows in d_ln1.
+    double tm = now_s();
+    CK(hipMemcpy(d_mtp_hin, d_ln1, (size_t)n_prompt * HID * 2, hipMemcpyDeviceToDevice));
+    CK(hipMemcpy(d_hlast, d_ln1 + (size_t)(n_prompt - 1) * HID, (size_t)HID * 2, hipMemcpyDeviceToDevice));
+    if (n_prompt > 1) {
+      up(d_mtp_ids, prompt + 1, (size_t)(n_prompt - 1) * 4);
+      mtp_rows(d_mtp_hin, d_mtp_ids, n_prompt - 1, 1, false);
+    }
+    CK(hipDeviceSynchronize());
+    st->mtp_prefill_ms = (now_s() - tm) * 1000.0;
+  }
+  *prefill_ms = (now_s() - tp) * 1000.0;
+
+  double td = now_s();
+  int n_gen = 0, stop = 0;
+  auto commit = [&](int t) {
+    emit(ctx, t, sample ? logp : 0.f);
     n_gen++;
     for (int i = 0; i < n_eos; i++)
-      if (eos[i] == tok) { stop = 1; break; }
-    if (stop || n_gen >= max_tokens) break;
-    up(d_tok, &tok, 4);
-    forward(d_tok, 1, n_prompt - 1 + n_gen, 1);
-    if (sample) {
-      chlorine_sample_host(d_logits, counts.data(), (unsigned)(n_prompt + n_gen),
-                           opts, &tok, &logp);
-      counts[tok]++;
-    } else {
-      k_argmax1<<<1, 256>>>(d_logits, d_pred, VOC);
-      CK(hipDeviceSynchronize());
-      CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
+      if (eos[i] == t) { stop = 1; break; }
+    return !stop && n_gen < max_tokens;
+  };
+  int n_proc = n_prompt;     // positions the trunk has processed
+  bool more = commit(tok);
+  const int maxg = spec_maxg();
+  while (more) {
+    const int remaining = (int)(max_tokens - n_gen);
+    int gd = spec ? std::min(maxg, remaining - 1) : 0;
+    gd = std::min(gd, CXT - 1 - n_proc);
+    if (gd < 1) {
+      // serial step
+      up(d_tok, &tok, 4);
+      forward(d_tok, 1, n_proc, 1);
+      if (sample) {
+        chlorine_sample_host(d_logits, counts.data(), (unsigned)(n_proc + 1), opts, &tok, &logp);
+        counts[tok]++;
+      } else {
+        k_argmax1<<<1, 256>>>(d_logits, d_pred, VOC);
+        CK(hipDeviceSynchronize());
+        CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
+        logit_hash(d_logits, n_proc);
+      }
+      n_proc++;
+      more = commit(tok);
+      continue;
     }
+    // ---- draft gd tokens with the MTP head ----
+    double t0 = now_s();
+    int drafts[8];
+    const uint16_t* hp = d_hlast;
+    int tk = tok;
+    static float pmin = -1.f;
+    if (pmin < 0.f) { const char* e = getenv("HALO_SPEC_PMIN"); pmin = e ? (float)atof(e) : 0.f; }
+    int nd = 0;
+    for (int j = 0; j < gd; j++) {
+      up(d_mtp_ids, &tk, 4);
+      mtp_rows(hp, d_mtp_ids, 1, n_proc + j, true);
+      CK(hipDeviceSynchronize());
+      float pr = 1.f;
+      CK(hipMemcpy(&drafts[j], d_pred, 4, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(&pr, d_draft_prob, 4, hipMemcpyDeviceToHost));
+      nd = j + 1;
+      hp = d_mtp_hout;
+      tk = drafts[j];
+      // stop early when the drafter is unsure: a low-probability draft is
+      // unlikely to be accepted, and every draft costs a verify row
+      if (pr < pmin) break;
+    }
+    gd = nd;
+    double t1 = now_s();
+    // ---- verify [tok, drafts] as gd+1 decode rows at n_proc.. ----
+    int vt[9], v[9];
+    vt[0] = tok;
+    for (int j = 0; j < gd; j++) vt[j + 1] = drafts[j];
+    up(d_tok, vt, (size_t)(gd + 1) * 4);
+    g_verify = 1;
+    forward(d_tok, gd + 1, n_proc, 1);
+    g_verify = 0;
+    k_argmax_rows<<<gd + 1, 256>>>(d_logits_mr, d_pred_mr, VOC);
+    CK(hipDeviceSynchronize());
+    CK(hipMemcpy(v, d_pred_mr, (size_t)(gd + 1) * 4, hipMemcpyDeviceToHost));
+    int a = 0;
+    while (a < gd && drafts[a] == v[a]) a++;
+    for (int i = 0; i <= a; i++) logit_hash(d_logits_mr + (size_t)i * VOC, n_proc + i);
+    double t2 = now_s();
+    // ---- accept a drafts + the trunk's token v[a]; roll state to row a ----
+    CK(hipMemcpy(d_mtp_hin, d_ln1, (size_t)(a + 1) * HID * 2, hipMemcpyDeviceToDevice));
+    CK(hipMemcpy(d_hlast, d_ln1 + (size_t)a * HID, (size_t)HID * 2, hipMemcpyDeviceToDevice));
+    ring_set(g_ring_cur + a + 1);
+    const int base = n_proc;
+    n_proc += a + 1;
+    // MTP KV repair: positions base+1..base+a get the trunk's hidden, not the draft's
+    if (a >= 1) {
+      up(d_mtp_ids, drafts, (size_t)a * 4);
+      mtp_rows(d_mtp_hin, d_mtp_ids, a, base + 1, false);
+    }
+    CK(hipDeviceSynchronize());
+    double t3 = now_s();
+    st->rounds++;
+    st->proposed += gd;
+    st->accepted += a;
+    st->draft_ms += (t1 - t0) * 1000.0;
+    st->verify_ms += (t2 - t1) * 1000.0;
+    st->ingest_ms += (t3 - t2) * 1000.0;
+    for (int i = 0; i <= a && more; i++) {
+      more = commit(v[i]);
+      st->committed++;
+    }
+    tok = v[a];
   }
   *decode_ms = (now_s() - td) * 1000.0;
   *stop_hit = stop;
+  if (spec)
+    fprintf(stderr, "spec: rounds %d proposed %d accepted %d (%.3f) committed %d tokens/round %.2f draft %.1f ms verify %.1f ms ingest %.1f ms mtp-prefill %.1f ms\n",
+            st->rounds, st->proposed, st->accepted, st->proposed ? (double)st->accepted / st->proposed : 0.0,
+            st->committed, st->rounds ? (double)st->committed / st->rounds : 0.0,
+            st->draft_ms, st->verify_ms, st->ingest_ms, st->mtp_prefill_ms);
   return n_gen;
+}
+
+extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long max_tokens,
+                                        const int* eos, int n_eos,
+                                        void (*emit)(void*, int, float), void* ctx,
+                                        double* prefill_ms, double* decode_ms, int* stop_hit,
+                                        const chlorine_sample_opts* opts) {
+  return chlorine_trunk_generate3(prompt, n_prompt, max_tokens, eos, n_eos, emit, ctx,
+                                  prefill_ms, decode_ms, stop_hit, opts, 0, nullptr);
 }
 
 extern "C" int chlorine_trunk_ctx_cap(void) { return CXT; }

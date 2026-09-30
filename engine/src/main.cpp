@@ -38,6 +38,16 @@ int chlorine_trunk_generate2(const int* prompt, int n_prompt, long max_tokens,
                              void (*emit)(void*, int, float), void* ctx,
                              double* prefill_ms, double* decode_ms, int* stop_hit,
                              const chlorine_sample_opts* opts);
+struct chlorine_spec_stats {
+  int drafter, rounds, proposed, accepted, committed;
+  double draft_ms, verify_ms, ingest_ms, mtp_prefill_ms;
+};
+int chlorine_trunk_generate3(const int* prompt, int n_prompt, long max_tokens,
+                             const int* eos, int n_eos,
+                             void (*emit)(void*, int, float), void* ctx,
+                             double* prefill_ms, double* decode_ms, int* stop_hit,
+                             const chlorine_sample_opts* opts, int drafter,
+                             chlorine_spec_stats* st);
 int chlorine_trunk_ctx_cap(void);
 int chlorine_trunk_tmax(void);
 void chlorine_trunk_shutdown(void);
@@ -90,9 +100,10 @@ void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& e
   EmitCtx ec{id, fd, go.logprobs};
   double prefill_ms = 0, decode_ms = 0;
   int stop_hit = 0;
-  int n_gen = chlorine_trunk_generate2(prompt.data(), int(prompt.size()), max_tokens,
+  chlorine_spec_stats st{};
+  int n_gen = chlorine_trunk_generate3(prompt.data(), int(prompt.size()), max_tokens,
                                        eos.data(), int(eos.size()), trunk_emit, &ec,
-                                       &prefill_ms, &decode_ms, &stop_hit, &so);
+                                       &prefill_ms, &decode_ms, &stop_hit, &so, go.drafter, &st);
   if (n_gen < 0) {
     fprintf(stderr, "serve: request %ld prompt/max_tokens out of trunk capacity (%d)\n",
             id, n_gen);
@@ -102,8 +113,10 @@ void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& e
     return;
   }
   char buf[160];
-  snprintf(buf, sizeof buf, "D %ld %s %zu %d %.1f %.1f 0 0 0\n", id,
-           stop_hit ? "stop" : "length", prompt.size(), n_gen, prefill_ms, decode_ms);
+  // drafter / rounds / committed-in-rounds, as WIRE-PROTOCOL.md specifies
+  snprintf(buf, sizeof buf, "D %ld %s %zu %d %.1f %.1f %d %d %d\n", id,
+           stop_hit ? "stop" : "length", prompt.size(), n_gen, prefill_ms, decode_ms,
+           st.drafter, st.rounds, st.committed);
   size_t off = 0;
   size_t len = strlen(buf);
   while (off < len) {

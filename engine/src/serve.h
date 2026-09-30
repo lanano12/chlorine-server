@@ -52,6 +52,7 @@ class Server {
   GenerateFn gen_;
   void* gen_ctx_;
   std::string info_line_;
+  bool quit_ = false;   // set by the QUIT verb; serve() returns
 };
 
 }  // namespace chlorine

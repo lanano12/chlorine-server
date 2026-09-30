@@ -147,6 +147,10 @@ void Server::handle_line(int fd, const std::string& line) {
   } else if (verb.size() == 1 && verb[0] == 'X') {
     long id;
     in >> id;  // skeleton has no in-flight registry; ignore
+  } else if (verb == "QUIT") {
+    // graceful stop (profiler flush, harness teardown): reply, then leave serve()
+    send_all(fd, "BYE\n");
+    quit_ = true;
   }
   // anything else: ignored (same as the original)
 }
@@ -192,11 +196,15 @@ void Server::serve() {
         std::string line = buf.substr(0, pos);
         buf.erase(0, pos + 1);
         handle_line(fd, line);
-        alive = true;
+        alive = !quit_;
+        if (quit_) break;
       }
     }
     close(fd);
+    if (quit_) break;
   }
+  close(s);
+  fprintf(stderr, "serve: stopped on QUIT\n");
 }
 
 }  // namespace chlorine

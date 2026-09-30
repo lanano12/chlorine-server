@@ -276,10 +276,130 @@ __global__ void k_flash_transpose_v(const uint16_t* V, uint16_t* VT, int keys, i
       VT[((long)h*F_HD+d0+r)*stride+key0+lane] = tile[lane][r];
 }
 
+
+// ---- single-token (decode) attention: flash-decoding split over keys ----
+// One workgroup per (KV head, key split); each of its 8 waves streams a
+// disjoint set of keys for all 6 query heads that share the KV head, so K and
+// V are read once per step instead of once per query head. Lane l owns dims
+// [8l, 8l+8) of the 256-wide head; per key the 6 partial dots are reduced
+// across the wave, the online fp32 softmax updates (m, l, o[8]) per head, and
+// each wave writes its unnormalized partial. k_attn_decode_combine merges the
+// partials per query head with the usual max-rescaling and rounds once to
+// bf16. Numerics: fp32 throughout, probabilities never rounded to f16, so this
+// differs from both attn_tiled (global bf16 probabilities) and the prefill
+// flash kernel; the init-time compare and the token checks are its guard.
+static constexpr int SK_WAVES = 8;
+struct SkPartial { float m[6]; float l[6]; float o[6][F_HD]; };
+__global__ void __launch_bounds__(256)
+k_attn_decode_splitk(const uint16_t* __restrict__ Q, const uint16_t* __restrict__ K,
+                     const uint16_t* __restrict__ V, SkPartial* __restrict__ part,
+                     int keys, int chunk, int nsplit) {
+  const int kh = blockIdx.x, split = blockIdx.y;
+  const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int d0 = lane * 8;
+  float q[6][8];
+#pragma unroll
+  for (int h = 0; h < 6; h++) {
+    const uint4 qv = *reinterpret_cast<const uint4*>(Q + (size_t)(kh * 6 + h) * F_HD + d0);
+    const uint32_t w[4] = {qv.x, qv.y, qv.z, qv.w};
+#pragma unroll
+    for (int e = 0; e < 4; e++) { q[h][2 * e] = flash_bfloat((uint16_t)(w[e] & 0xFFFFu)); q[h][2 * e + 1] = flash_bfloat((uint16_t)(w[e] >> 16)); }
+  }
+  float m[6], l[6], o[6][8];
+#pragma unroll
+  for (int h = 0; h < 6; h++) { m[h] = -INFINITY; l[h] = 0.f; for (int e = 0; e < 8; e++) o[h][e] = 0.f; }
+  const int kbeg = split * chunk, kend = min(keys, kbeg + chunk);
+  for (int key = kbeg + wave; key < kend; key += SK_WAVES) {
+    const size_t row = ((size_t)key * F_KVH + kh) * F_HD + d0;
+    const uint4 kv = *reinterpret_cast<const uint4*>(K + row);
+    const uint4 vv = *reinterpret_cast<const uint4*>(V + row);
+    const uint32_t kw[4] = {kv.x, kv.y, kv.z, kv.w}, vw[4] = {vv.x, vv.y, vv.z, vv.w};
+    float kf[8], vf[8];
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+      kf[2 * e] = flash_bfloat((uint16_t)(kw[e] & 0xFFFFu)); kf[2 * e + 1] = flash_bfloat((uint16_t)(kw[e] >> 16));
+      vf[2 * e] = flash_bfloat((uint16_t)(vw[e] & 0xFFFFu)); vf[2 * e + 1] = flash_bfloat((uint16_t)(vw[e] >> 16));
+    }
+    float s[6];
+#pragma unroll
+    for (int h = 0; h < 6; h++) {
+      float acc = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; e++) acc = fmaf(q[h][e], kf[e], acc);
+      s[h] = acc;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+      for (int h = 0; h < 6; h++) s[h] += __shfl_xor(s[h], off);
+    }
+#pragma unroll
+    for (int h = 0; h < 6; h++) {
+      const float sc = s[h] * 0.0625f;
+      const float mn = fmaxf(m[h], sc);
+      const float corr = expf(m[h] - mn);       // 0 when m was -inf
+      const float p = expf(sc - mn);
+      l[h] = l[h] * corr + p;
+#pragma unroll
+      for (int e = 0; e < 8; e++) o[h][e] = fmaf(p, vf[e], o[h][e] * corr);
+      m[h] = mn;
+    }
+  }
+  SkPartial* P = part + (size_t)(kh * nsplit + split) * SK_WAVES + wave;
+#pragma unroll
+  for (int h = 0; h < 6; h++) {
+    if (lane == 0) { P->m[h] = m[h]; P->l[h] = l[h]; }
+    float4* op = reinterpret_cast<float4*>(P->o[h] + d0);
+    op[0] = make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+    op[1] = make_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
+  }
+}
+__global__ void __launch_bounds__(256)
+k_attn_decode_combine(const SkPartial* __restrict__ part, uint16_t* __restrict__ O, int nsplit) {
+  const int qh = blockIdx.x, kh = qh / 6, h = qh % 6, d = threadIdx.x;
+  const int np = nsplit * SK_WAVES;
+  const SkPartial* P = part + (size_t)kh * np;
+  float M = -INFINITY;
+  for (int i = 0; i < np; i++) M = fmaxf(M, P[i].m[h]);
+  float L = 0.f, acc = 0.f;
+  for (int i = 0; i < np; i++) {
+    const float w = expf(P[i].m[h] - M);        // 0 for empty partials (m == -inf)
+    L = fmaf(P[i].l[h], w, L);
+    acc = fmaf(P[i].o[h][d], w, acc);
+  }
+  O[(size_t)qh * F_HD + d] = flash_out(acc / L);
+}
+static int attention_decode_splitk(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
+                                   uint16_t* O, int keys) {
+  static SkPartial* part = nullptr;
+  static int cap = 0;
+  int nsplit = (keys + 255) / 256;
+  if (nsplit > 32) nsplit = 32;
+  if (nsplit < 1) nsplit = 1;
+  const int chunk = (keys + nsplit - 1) / nsplit;
+  const int need = F_KVH * 32 * SK_WAVES;
+  if (!part || cap < need) {
+    if (part) { hipError_t e = hipFree(part); if (e != hipSuccess) return (int)e; }
+    hipError_t e = hipMalloc(&part, (size_t)need * sizeof(SkPartial)); if (e != hipSuccess) return (int)e;
+    cap = need;
+  }
+  k_attn_decode_splitk<<<dim3(F_KVH, nsplit), 256>>>(Q, K, V, part, keys, chunk, nsplit);
+  hipError_t e = hipGetLastError(); if (e != hipSuccess) return (int)e;
+  k_attn_decode_combine<<<F_QH, F_HD>>>(part, O, nsplit);
+  return (int)hipGetLastError();
+}
+
 static int attention_flash_impl(const uint16_t* Q, const uint16_t* K,
                                          const uint16_t* V, uint16_t* O,
                                          int T, int pos_base, bool sync) {
   if (T < 1 || pos_base < 0) return -1;
+  static int splitk = -1;
+  if (splitk < 0) { const char* e = getenv("HALO_ATTN_SPLITK"); splitk = (e && atoi(e) == 1) ? 1 : 0; }
+  if (T == 1 && splitk) {
+    int rc = attention_decode_splitk(Q, K, V, O, pos_base + 1);
+    if (rc == 0 && sync) rc = (int)hipDeviceSynchronize();
+    return rc;
+  }
   const char* cfg = getenv("HALO_FLASH_OPT");
   // Keep single-token attention on the phase-2E path: transposing the whole
   // KV prefix on every decode step would add work unrelated to prefill.
@@ -318,4 +438,11 @@ extern "C" int chlorine_attention_flash(const uint16_t* Q,const uint16_t* K,
 extern "C" int chlorine_attention_flash_async(const uint16_t* Q,const uint16_t* K,
                                                const uint16_t* V,uint16_t* O,int T,int pos_base) {
   return attention_flash_impl(Q,K,V,O,T,pos_base,false);
+}
+
+extern "C" int chlorine_attention_decode_splitk(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
+                                                uint16_t* O, int pos_base) {
+  int rc = attention_decode_splitk(Q, K, V, O, pos_base + 1);
+  if (rc == 0) rc = (int)hipDeviceSynchronize();
+  return rc;
 }

@@ -5738,6 +5738,102 @@ k_gdn_scan_persistent(const float* __restrict__ kcd, const float* __restrict__ q
 }
 
 static float* g_blob = nullptr;
+
+// Single-token step (T == 1): one launch per layer instead of prep, grams,
+// solve and one chunk of gemv/out/state over a zero-padded 64-row chunk.
+// Every expression is the chunk path's expression for row a == 0 with the
+// padded rows contributing nothing: cum[0] = 0 + g, cum[63] - cum[0] = 0,
+// nv = V*B (no substitution terms), kcd = (K*B)*exp(cum), qd = Q*exp(cum),
+// kd = K*exp(0), W[0][0] = (q.k)*exp(0), then the same i-ordered gemv sums,
+// the same out expression and the same state update. Bit-exact with the
+// chunk path by construction; bench/gdn_gpu_check.hip's T=1 case is the test.
+__global__ void __launch_bounds__(128)
+k_gdn_step1(const uint16_t* __restrict__ qkv, const float* __restrict__ gateG,
+            const float* __restrict__ gateB, const float* Sin, float* Sout,
+            uint16_t* __restrict__ out, int dnprep, float qscale) {
+  // Sin == Sout is the in-place serial step. A distinct Sout writes the new
+  // state to another ring slot (speculative verify) with identical values:
+  // thread j reads and writes only column j of each head's state.
+  const int hh = (int)blockIdx.x;
+  const int j = (int)threadIdx.x;               // 0..127: key dim i for prep, value column j after
+  __shared__ float sq[GDN_DK], sk[GDN_DK];
+  __shared__ float Qs[GDN_DK], Ks[GDN_DK], Vs[GDN_DV];
+  __shared__ float sc[4];
+  const uint16_t* qp = qkv + (hh / 3) * GDN_DK;
+  const uint16_t* kp = qkv + GDN_HK * GDN_DK + (hh / 3) * GDN_DK;
+  const uint16_t* vp = qkv + GDN_HK * GDN_DK * 2 + hh * GDN_DV;
+  {
+    float a = gdn_bf16f(qp[j]);
+    float b = gdn_bf16f(kp[j]);
+    sq[j] = a * a;
+    sk[j] = b * b;
+  }
+  __syncthreads();
+  if (j == 0) {
+    float qs = 0.f, ks = 0.f;
+    for (int i = 0; i < GDN_DK; i++) {
+      qs += sq[i];
+      ks += sk[i];
+    }
+    sc[0] = 1.0f / sqrtf(qs + GDN_EPS) * qscale;
+    sc[1] = 1.0f / sqrtf(ks + GDN_EPS);
+  }
+  __syncthreads();
+  {
+    float qv = gdn_bf16f(qp[j]) * sc[0];
+    float kv = gdn_bf16f(kp[j]) * sc[1];
+    if (dnprep) {
+      qv = gdn_bf16f(gdn_f32bf_host(qv));
+      kv = gdn_bf16f(gdn_f32bf_host(kv));
+    }
+    Qs[j] = qv;
+    Ks[j] = kv;
+    Vs[j] = gdn_bf16f(vp[j]);
+  }
+  __syncthreads();
+  // gates and exponentials exactly as k_gdn_grams computes them for chunk 0
+  float cum0 = 0.f;
+  cum0 += gateG[hh];                 // cum[0]; the 63 padded rows add 0 and leave cum[63] == cum[0]
+  const float B = gateB[hh];
+  const float ec = gdn_expf(cum0);                 // eh[0]
+  const float ecd = gdn_expf(cum0 - cum0);         // eh[CS + 0]
+  const float decay = gdn_expf(cum0);              // eh[2 * CS]
+  const float decay00 = gdn_expf(cum0 - cum0);     // grams' decay for the (0,0) pair
+  float qkd = 0.f;
+  if (decay00 != 0.f) {
+    for (int i = 0; i < GDN_DK; i++) {
+      float kv = Ks[i];
+      qkd += Qs[i] * kv;
+    }
+  }
+  const float W = qkd * decay00;                   // intra[0][0]
+  // solve row 0
+  const float nv = Vs[j] * B;
+  // gemv: i-ordered sums against the state column j
+  const float* Sh = Sin + ((long)hh * GDN_DK) * GDN_DV;
+  float s1 = 0.f, s2v = 0.f;
+  for (int i = 0; i < GDN_DK; i++) {
+    float Si = Sh[(long)i * GDN_DV + j];
+    float krow = (Ks[i] * B) * ec;                 // kcd[0][i]
+    float qrow = Qs[i] * ec;                       // qd[0][i]
+    s1 += krow * Si;
+    s2v += qrow * Si;
+  }
+  const float vn = nv - s1;
+  // out
+  float inter = s2v;
+  if (W != 0.f) inter += W * vn;
+  out[hh * GDN_DV + j] = gdn_f32bf_host(inter);
+  // state update: S = S*decay + kd*vn, kd[0][i] = K[i]*ecd
+  for (int i = 0; i < GDN_DK; i++) {
+    long sbase = ((long)hh * GDN_DK + i) * GDN_DV + j;
+    float s = Sh[(long)i * GDN_DV + j] * decay;
+    float kk = Ks[i] * ecd;
+    s += kk * vn;
+    Sout[sbase] = s;
+  }
+}
+
 static int g_tpad = 0;
 static float *g_Q, *g_K, *g_V, *g_nv, *g_kcd, *g_qd, *g_kd, *g_vn, *g_s2, *g_ut, *g_intra, *g_exps;
 
@@ -5786,6 +5882,14 @@ static int gdn_gpu_impl(const uint16_t* qkv, const float* gateG, const float* ga
                                 float* S, uint16_t* out, int T, int dnprep, float qscale, bool sync) {
   int rc = gdn_ensure(T);
   if (rc) return rc;
+  static int step1 = -1;
+  if (step1 < 0) { const char* e = getenv("HALO_GDN_STEP1"); step1 = (e && atoi(e) == 1) ? 1 : 0; }
+  if (T == 1 && step1) {
+    k_gdn_step1<<<GDN_HV, 128>>>(qkv, gateG, gateB, S, S, out, dnprep, qscale);
+    if (gdn_ck(hipGetLastError(), "step1")) return -2;
+    if (sync && gdn_ck(hipDeviceSynchronize(), "sync")) return -2;
+    return 0;
+  }
   int tpad = g_tpad;
   int nch = (T + GDN_CS - 1) / GDN_CS;
   int ngroups = T * GDN_HV;
@@ -5836,4 +5940,16 @@ extern "C" int chlorine_gdn_gpu_async(const uint16_t* qkv, const float* G, const
 
 extern "C" int chlorine_gdn_reserve(int T) {
   return gdn_ensure(T);
+}
+
+// One token of recurrence from state Sin into Sout (may be equal). Used by the
+// speculative verify pass, one call per verified row; bit-exact with the
+// single-token step and therefore with the chunk path.
+extern "C" int chlorine_gdn_step_io(const uint16_t* qkv, const float* G, const float* B,
+                                    const float* Sin, float* Sout, uint16_t* out,
+                                    int dnprep, float qscale, int sync) {
+  k_gdn_step1<<<GDN_HV, 128>>>(qkv, G, B, Sin, Sout, out, dnprep, qscale);
+  if (gdn_ck(hipGetLastError(), "step_io")) return -2;
+  if (sync && gdn_ck(hipDeviceSynchronize(), "sync")) return -2;
+  return 0;
 }
