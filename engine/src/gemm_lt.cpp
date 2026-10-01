@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -30,7 +31,18 @@ struct Entry {
   hipblasLtMatrixLayout_t Ad{};
   hipblasLtMatrixLayout_t Cd{};
   hipblasLtMatmulHeuristicResult_t heur{};
+  bool tuned = false;
 };
+// HALO_GEMM_TUNE=1: for M >= 2048 (long prefills only; the short validation
+// prompts keep the first-ranked algorithm) the first call of each shape times
+// up to 16 heuristic candidates on the real buffers and keeps the fastest.
+// Different algorithms sum in different orders, so this is a declared
+// numerics change for long prompts.
+int tune_mode() {
+  static int v = -1;
+  if (v < 0) { const char* e = getenv("HALO_GEMM_TUNE"); v = (e && atoi(e) == 1) ? 1 : 0; }
+  return v;
+}
 
 hipblasLtHandle_t g_handle = nullptr;
 hipblasLtMatmulPreference_t g_pref = nullptr;
@@ -103,11 +115,42 @@ const Entry* cached(int M, int N, int K, int f32) {
   return &ins.first->second;
 }
 
+void tune(Entry* e, const void* A, const void* W, void* C, int M, int N, int K) {
+  e->tuned = true;
+  hipblasLtMatmulHeuristicResult_t cand[16];
+  int n = 0;
+  if (hipblasLtMatmulAlgoGetHeuristic(g_handle, e->desc, e->Wd, e->Ad, e->Cd, e->Cd, g_pref, 16, cand, &n) != HIPBLAS_STATUS_SUCCESS || n < 2)
+    return;
+  hipEvent_t a, b;
+  if (hipEventCreate(&a) != hipSuccess || hipEventCreate(&b) != hipSuccess) return;
+  float alpha = 1.f, beta = 0.f, best = 1e30f, first = -1.f;
+  int bi = 0;
+  for (int i = 0; i < n; i++) {
+    if (cand[i].state != HIPBLAS_STATUS_SUCCESS) continue;
+    float tmin = 1e30f;
+    for (int r = 0; r < 2; r++) {
+      (void)hipEventRecord(a, nullptr);
+      hipblasStatus_t st = hipblasLtMatmul(g_handle, e->desc, &alpha, W, e->Wd, A, e->Ad, &beta, C, e->Cd, C, e->Cd,
+                                           &cand[i].algo, g_ws, g_ws_bytes, nullptr);
+      (void)hipEventRecord(b, nullptr);
+      (void)hipEventSynchronize(b);
+      if (st != HIPBLAS_STATUS_SUCCESS) { tmin = 1e30f; break; }
+      float ms = 0.f; (void)hipEventElapsedTime(&ms, a, b); tmin = std::min(tmin, ms);
+    }
+    if (i == 0) first = tmin;
+    if (tmin < best) { best = tmin; bi = i; }
+  }
+  (void)hipEventDestroy(a); (void)hipEventDestroy(b);
+  if (bi != 0 && best < 1e29f) e->heur = cand[bi];
+  fprintf(stderr, "gemm tune: M %d N %d K %d: %d candidates, rank-0 %.2f ms, chosen rank %d %.2f ms\n", M, N, K, n, first, bi, best);
+}
+
 int matmul(const void* A, const void* W, void* C, int M, int N, int K, int f32) {
   if (M < 1 || N < 1 || K < 1) return -1;
   if (ensure_handle() != 0) return -2;
   const Entry* e = cached(M, N, K, f32);
   if (!e) return -1;
+  if (tune_mode() && M >= 2048 && !e->tuned) tune(const_cast<Entry*>(e), A, W, C, M, N, K);
   float alpha = 1.f, beta = 0.f;
   hipblasStatus_t st = hipblasLtMatmul(
       g_handle, e->desc, &alpha, W, e->Wd, A, e->Ad, &beta, C, e->Cd, C, e->Cd,

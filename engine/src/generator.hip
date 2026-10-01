@@ -965,6 +965,7 @@ static int gate_dt5(int l) {
 
 #include "gemm_i4.h"
 #include "gemm_w4a8.h"
+#include "gemm_wdec.h"
 
 // ---- W4A4 prefill (HALO_W4A4): resident .i4l planes + native iu4 WMMA GEMM ----
 // 1 = all 400 projection planes (Halogen's shipped "W4A4-all-400"); 2 = the
@@ -1224,6 +1225,37 @@ static void a8q(const uint16_t* A, int T, int K) {
     g_a8_src = A; g_a8_T = T; g_a8_K = K;
   }
 }
+// HALO_WMMA_DEC=1: bf16 WMMA decode GEMM for serial steps, verify rows and
+// lm_head (gemm_wdec.h); per-row arithmetic independent of the row count.
+static int g_wmma_dec = 0;
+struct WdecInfo { bool ok = false; wdec::LvTable lv{}; float G = 0.f; };
+static std::map<std::string, WdecInfo> g_wdec_cb;
+static bool wdec_gemm(const char* name, const WEnt& w, const uint16_t* A, uint16_t* C, int T) {
+  if (!g_wmma_dec || w.cols % wdec::KC || w.rows % 16) return false;
+  int rc;
+  if (w.dt == 5) {
+    auto it = g_wdec_cb.find(name);
+    if (it == g_wdec_cb.end()) {
+      float cb[16];
+      CK(hipMemcpy(cb, d_wpool + w.off, 64, hipMemcpyDeviceToHost));
+      WdecInfo inf; inf.ok = wdec::lv_from_codebook(cb, &inf.lv, &inf.G);
+      if (!inf.ok) fprintf(stderr, "wmma-dec: %s codebook is not G * bf16 levels; GEMV kept\n", name);
+      it = g_wdec_cb.emplace(name, inf).first;
+    }
+    if (!it->second.ok) return false;
+    rc = wdec::launch<false>(1, A, d_wpool + w.off + 64, nullptr, w.cols / 2 + w.cols / 16, it->second.lv, it->second.G, C, T, (int)w.rows, (int)w.cols);
+  } else {
+    rc = wdec::launch<false>(0, A, d_wpool + w.off, (const uint16_t*)(d_wpool + w.off + (size_t)w.rows * w.cols), w.cols,
+                             wdec::LvTable{}, 0.f, C, T, (int)w.rows, (int)w.cols);
+  }
+  if (rc) { fprintf(stderr, "wmma-dec: launch failed for %s (%d)\n", name, rc); exit(1); }
+  return true;
+}
+static uint8_t* d_lmhead_q_fwd = nullptr; static uint16_t* d_lmhead_s_fwd = nullptr;   // set at lm_head load
+static void wdec_lmhead(const uint16_t* A, float* C, int T) {
+  int rc = wdec::launch<true>(2, A, d_lmhead_q_fwd, d_lmhead_s_fwd, HID, wdec::LvTable{}, 0.f, C, T, VOC, HID);
+  if (rc) { fprintf(stderr, "wmma-dec: lm_head launch failed (%d)\n", rc); exit(1); }
+}
 static void w4a8_gemm(const uint16_t* A, const I4Plane* p, uint16_t* C, int T, int N, int K) {
   a8q(A, T, K);
   int rc = w4a8::gemm_w4a8_launch(d_a8c, d_a8s, p->c, p->s, C, T, N, K, false, nullptr);
@@ -1236,6 +1268,7 @@ static bool gemv_dq(const uint16_t* A, const char* name, uint16_t* C) {  if (!d_
   auto it = g_wmap.find(name);
   if (it == g_wmap.end()) return false;
   const WEnt& w = it->second;
+  if (!w4dec_plane(name, w) && wdec_gemm(name, w, A, C, 1)) return true;
   if (const I4Plane* p = w4dec_plane(name, w)) {
     if (g_w4dec == 3) { w4a8_gemm(A, p, C, 1, (int)w.rows, (int)w.cols); return true; }
     const uint16_t* R = arot(A, 1, (int)w.cols);
@@ -1292,6 +1325,7 @@ static void gemv_dq_mr(const uint16_t* A, const char* name, const WEnt& w, uint1
   const int N = (int)w.rows, K = (int)w.cols;
   if (N % 4) { fprintf(stderr, "verify: %d rows not a multiple of 4\n", N); exit(1); }
   const bool nt = g_gemv_vec >= 2;
+  if (!w4dec_plane(name, w) && wdec_gemm(name, w, A, C, P)) return;
   if (const I4Plane* p = w4dec_plane(name, w)) {
     if (g_w4dec == 3) { w4a8_gemm(A, p, C, P, N, K); return; }
     const uint16_t* R = arot(A, P, K);
@@ -1340,6 +1374,7 @@ static void ab_gemv_rows(const uint16_t* A, const uint16_t* W, uint16_t* C, int 
   }
 }
 static void lmhead_mr(const uint16_t* A, int T) {
+  if (g_wmma_dec) { d_lmhead_q_fwd = d_lmhead_q; d_lmhead_s_fwd = d_lmhead_s; wdec_lmhead(A, d_logits_mr, T); return; }
   switch (T) {
     case 2: k_gemv_lmhead_fp8r_vec_mr<2><<<VOC, 256>>>(A, d_lmhead_q, d_lmhead_s, d_logits_mr, HID, VOC); break;
     case 3: k_gemv_lmhead_fp8r_vec_mr<3><<<VOC, 256>>>(A, d_lmhead_q, d_lmhead_s, d_logits_mr, HID, VOC); break;
@@ -2062,6 +2097,9 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     // writes rows nothing reads.
     if (g_verify) {
       lmhead_mr(d_ln1, T);
+    } else if (d_lmhead_q && g_wmma_dec) {
+      d_lmhead_q_fwd = d_lmhead_q; d_lmhead_s_fwd = d_lmhead_s;
+      wdec_lmhead(d_ln1 + (long)(T - 1) * HID, d_logits, 1);
     } else if (d_lmhead_q) {
       // HALO_LMHEAD_FP8=1: the stored fp8r plane (1.27 GB) instead of the bf16
       // copy (2.54 GB); each weight is rounded to bf16 exactly as k_dequant_fp8r
@@ -2645,6 +2683,8 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   if (getenv("HALO_W4A4")) g_w4a4 = atoi(getenv("HALO_W4A4"));
   if (getenv("HALO_W4DEC")) g_w4dec = atoi(getenv("HALO_W4DEC"));
   if (getenv("HALO_VERIFY_MERGE")) g_verify_merge = atoi(getenv("HALO_VERIFY_MERGE"));
+  if (getenv("HALO_WMMA_DEC")) g_wmma_dec = atoi(getenv("HALO_WMMA_DEC"));
+  if (g_wmma_dec) fprintf(stderr, "wmma-dec: bf16 WMMA decode GEMM for serial, verify and lm_head (declared numerics change)\n");
   if (getenv("HALO_DNPREP")) g_dnprep = atoi(getenv("HALO_DNPREP"));
   if (getenv("HALO_BETA32")) g_beta32 = atoi(getenv("HALO_BETA32"));
 
@@ -3273,9 +3313,17 @@ extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long ma
   int n_proc = n_prompt;     // positions the trunk has processed
   bool more = commit(tok);
   const int maxg = dfl ? DF_B - 1 : mtp_gamma();
+  // HALO_SPEC_ADAPT=1: verify only as many drafts as recent rounds accept
+  // (EMA of the accepted count + 2). Drafter-side only; the emitted tokens
+  // are the serial ones whatever the length.
+  static int adapt = -1;
+  if (adapt < 0) { const char* e = getenv("HALO_SPEC_ADAPT"); adapt = (e && atoi(e) == 1) ? 1 : 0; }
+  float acc_ema = dfl ? 3.0f : 2.0f;
   while (more) {
     const int remaining = (int)(max_tokens - n_gen);
     int gd = spec ? std::min(maxg, remaining - 1) : 0;
+    const int gcap = adapt ? std::max(1, std::min(maxg, (int)ceilf(acc_ema) + 2)) : maxg;
+    if (!dfl) gd = std::min(gd, gcap);
     gd = std::min(gd, CXT - 1 - n_proc);
     if (gd < 1) {
       // serial step
@@ -3337,6 +3385,7 @@ extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long ma
       if (pr < pmin) break;
     }
     gd = nd;
+    if (dfl) gd = std::min(gd, gcap);
     double t1 = now_s();
     // ---- verify [tok, drafts] as gd+1 decode rows at n_proc.. ----
     int vt[9], v[9];
@@ -3373,6 +3422,7 @@ extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long ma
     st->rounds++;
     st->proposed += gd;
     st->accepted += a;
+    acc_ema = 0.75f * acc_ema + 0.25f * (float)a;
     st->draft_ms += (t1 - t0) * 1000.0;
     st->verify_ms += (t2 - t1) * 1000.0;
     st->ingest_ms += (t3 - t2) * 1000.0;
