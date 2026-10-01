@@ -250,6 +250,32 @@ __global__ void k_conv1d_step_io(const uint16_t* __restrict__ X, const uint16_t*
   sto[c * 3 + 1] = s2;
   sto[c * 3 + 2] = X[c];
 }
+// T sequential conv steps in one launch (HALO_VERIFY_MERGE=1): row r reads the
+// history slot p[r] and writes p[r+1]; channel c's history is carried in
+// registers, so each row sees exactly what k_conv1d_step_io would have read.
+struct ConvSlots { uint16_t* p[9]; };
+__global__ void k_conv1d_step_rows(const uint16_t* __restrict__ X, const uint16_t* __restrict__ Wc,
+                                   uint16_t* __restrict__ O, ConvSlots slots, int T) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= QKVW) return;
+  const uint16_t* sti = slots.p[0];
+  uint16_t s0 = sti[c * 3 + 0], s1 = sti[c * 3 + 1], s2 = sti[c * 3 + 2];
+  const float w0 = bf16f(Wc[c * 4 + 0]), w1 = bf16f(Wc[c * 4 + 1]), w2 = bf16f(Wc[c * 4 + 2]), w3 = bf16f(Wc[c * 4 + 3]);
+  for (int r = 0; r < T; r++) {
+    const uint16_t x = X[(long)r * QKVW + c];
+    float acc = fmaf(bf16f(s0), w0, 0.0f);
+    acc = fmaf(bf16f(s1), w1, acc);
+    acc = fmaf(bf16f(s2), w2, acc);
+    acc = fmaf(bf16f(x), w3, acc);
+    float inv = 1.0f / (1.0f + expf(-acc));
+    O[(long)r * QKVW + c] = f32bf(acc * inv);
+    uint16_t* sto = slots.p[r + 1];
+    sto[c * 3 + 0] = s1;
+    sto[c * 3 + 1] = s2;
+    sto[c * 3 + 2] = x;
+    s0 = s1; s1 = s2; s2 = x;
+  }
+}
 // per-row argmax, row r identical to k_argmax1 on that row
 __global__ void k_argmax_rows(const float* __restrict__ L, int* __restrict__ pred, int V) {
   const float* Lr = L + (size_t)blockIdx.x * V;
@@ -286,15 +312,19 @@ __global__ void k_dequant_q4c_v1(const float* __restrict__ cb, const uint8_t* __
   float s = __half2float(__ushort_as_half(sc[c >> 5]));
   out[i] = f32bf(cb[code] * s);
 }
+// st: the three inputs before this block of rows (oldest first), for rows whose
+// window reaches before the block. At pos_base 0 the history is zero, and
+// fmaf(w, 0, acc) leaves acc unchanged, so the cold path is unchanged.
 __global__ void k_conv1d(const uint16_t* __restrict__ X, const uint16_t* __restrict__ Wc,
-                         uint16_t* __restrict__ O, long T) {
+                         uint16_t* __restrict__ O, long T, const uint16_t* __restrict__ st) {
   long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
   if (i >= T * QKVW) return;
   int t = (int)(i / QKVW), c = (int)(i % QKVW);
   float acc = 0.f;
   for (int j = 0; j < 4; j++) {
     int tt = t + j - 3;
-    if (tt >= 0) acc = fmaf(bf16f(Wc[c * 4 + j]), bf16f(X[(long)tt * QKVW + c]), acc);
+    uint16_t x = tt >= 0 ? X[(long)tt * QKVW + c] : st[c * 3 + (tt + 3)];
+    acc = fmaf(bf16f(Wc[c * 4 + j]), bf16f(x), acc);
   }
   float inv = 1.0f / (1.0f + expf(-acc));
   O[i] = f32bf(acc * inv);
@@ -316,9 +346,10 @@ __global__ void k_conv1d_step(const uint16_t* __restrict__ X, const uint16_t* __
 __global__ void k_conv_setstate(const uint16_t* __restrict__ X, uint16_t* __restrict__ st, long T) {
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= QKVW) return;
+  uint16_t old[3] = {st[c * 3 + 0], st[c * 3 + 1], st[c * 3 + 2]};
   for (int j = 0; j < 3; j++) {
     long tt = T - 3 + j;
-    st[c * 3 + j] = (tt >= 0) ? X[tt * QKVW + c] : (uint16_t)0;   // zero pad (prefill T < 3)
+    st[c * 3 + j] = (tt >= 0) ? X[tt * QKVW + c] : old[tt + 3];   // carry the previous history for short blocks
   }
 }
 
@@ -932,6 +963,55 @@ static int gate_dt5(int l) {
   return e && e->dt == 5;
 }
 
+#include "gemm_i4.h"
+#include "gemm_w4a8.h"
+
+// ---- W4A4 prefill (HALO_W4A4): resident .i4l planes + native iu4 WMMA GEMM ----
+// 1 = all 400 projection planes (Halogen's shipped "W4A4-all-400"); 2 = the
+// FFN planes of the q4c layers only. Prefills of 64 rows or more quantize the
+// activation per 256-chunk (k_actq_emit: Hadamard, f16 absmax/7 scale, codes
+// in [-7,7]) and call gemm_i4_launch, which is bit-identical to k_gemm_i4emul.
+// Decode, speculative verify and prefills under 64 rows keep the bf16 path.
+// This is a declared quality configuration, not bf16-exact.
+static int g_w4a4 = 0;
+// HALO_W4DEC (W4 decode, a declared quality configuration): decode and verify
+// GEMVs read the resident .i4l plane instead of the fp8r/q4c plane. 1 = the
+// fp8r-stored planes only (attention q/k/v/o, GDN qkv/z/out: 9.4 GB of fp8 ->
+// 4.7 GB of int4 per step), 2 = every plane with an .i4l twin. The activation
+// is Hadamard-rotated per 256-chunk (k_had_rows) and stays bf16 (W4A16).
+static int g_w4dec = 0;
+static int g_verify_merge = 0;   // HALO_VERIFY_MERGE=1: per-layer multi-row kernels in the verify pass
+struct I4Plane { uint8_t* c = nullptr; uint16_t* s = nullptr; long rows = 0, cols = 0; };
+static std::map<std::string, I4Plane> g_i4map;
+static size_t g_i4_bytes = 0;
+static bool i4_add(const char* base, long rows, long cols) {
+  char full[176];
+  snprintf(full, sizeof(full), "%s.i4l", base);
+  const Ent* e = find(full);
+  if (!e || e->dt != 8) { fprintf(stderr, "w4a4: %s missing\n", full); return false; }
+  const long per = cols >> 1, nsc = cols >> 8;
+  if ((size_t)e->size != (size_t)rows * per + (size_t)rows * nsc * 2) { fprintf(stderr, "w4a4: %s size mismatch\n", full); return false; }
+  I4Plane p; p.rows = rows; p.cols = cols;
+  CK(hipMalloc((void**)&p.c, (size_t)rows * per));
+  CK(hipMalloc((void**)&p.s, (size_t)rows * nsc * 2));
+  long chunk = (long)((32L << 20) / per); if (chunk < 1) chunk = 1;
+  for (long r0 = 0; r0 < rows; r0 += chunk) {
+    long nr = chunk < rows - r0 ? chunk : rows - r0;
+    rd(e->off + r0 * per, h_stage, (size_t)nr * per);
+    up(p.c + r0 * per, h_stage, (size_t)nr * per);
+    rd(e->off + rows * per + r0 * nsc * 2, h_stage2, (size_t)nr * nsc * 2);
+    up((uint8_t*)(p.s + r0 * nsc), h_stage2, (size_t)nr * nsc * 2);
+  }
+  g_i4_bytes += (size_t)e->size;
+  g_i4map[base] = p;
+  return true;
+}
+static inline const I4Plane* i4_plane(const char* base) {
+  auto it = g_i4map.find(base);
+  return it == g_i4map.end() ? nullptr : &it->second;
+}
+static void init_i4_planes();
+
 static void getw(const char* name, long rows, long cols, uint16_t*& d_out) {
   if (!g_bfmap.empty()) {
     auto cached = g_bfmap.find(name);
@@ -965,6 +1045,11 @@ static void getw(const char* name, long rows, long cols, uint16_t*& d_out) {
     if (try_find(nm2)) { load_i4l(nm2, rows, cols, d_out); return; }
   }
   load_auto(name, rows, cols, d_out);
+}
+// skip the bf16 weight preparation for a plane the int4 path will use
+static inline void getw_i4(const char* name, long rows, long cols, uint16_t*& d_out, bool i4) {
+  if (i4 && g_i4map.count(name)) return;
+  getw(name, rows, cols, d_out);
 }
 
 static void init_bf16_weight_cache() {
@@ -1095,6 +1180,55 @@ __global__ void k_gemm_fp8r(const uint16_t* __restrict__ A, const uint8_t* __res
 // base is 16-byte aligned; otherwise the phase-2 kernel runs.
 static int g_gemv_vec = 0;
 static int g_ab_gemv = 0;   // HALO_AB_GEMV=1: GDN a/b gate projections by GEMV at T == 1
+// out-of-place Hadamard-256 rotation of T bf16 rows (same arithmetic as
+// k_had_cols / the rotation in k_actq_emit); grid (T, cols/256)
+__global__ void k_had_rows(const uint16_t* __restrict__ X, uint16_t* __restrict__ Y, long cols) {
+  __shared__ float sh[256];
+  int tid = threadIdx.x;
+  long base = (long)blockIdx.x * cols + (long)blockIdx.y * 256;
+  sh[tid] = bf16f(X[base + tid]);
+  __syncthreads();
+  for (int len = 1; len < 256; len <<= 1) {
+    float a = sh[tid], b = sh[tid ^ len];
+    __syncthreads();
+    sh[tid] = ((tid & len) ? b - a : a + b);
+    __syncthreads();
+  }
+  Y[base + tid] = f32bf(sh[tid] * (1.0f / 16.0f));
+}
+static uint16_t* d_arot = nullptr;          // [8][INTM] rotated activation rows
+static const uint16_t* g_arot_src = nullptr; static int g_arot_T = 0, g_arot_K = 0;
+static const uint16_t* g_a8_src = nullptr; static int g_a8_T = 0, g_a8_K = 0;   // W4A8 quantization cache (a8q below)
+static inline void arot_reset() { g_arot_src = nullptr; g_a8_src = nullptr; }
+// rotated copy of T rows of A (length K); cached per (A, T, K) within a layer
+static const uint16_t* arot(const uint16_t* A, int T, int K) {
+  if (A != g_arot_src || T != g_arot_T || K != g_arot_K) {
+    k_had_rows<<<dim3((unsigned)T, (unsigned)(K / 256)), 256>>>(A, d_arot, K);
+    g_arot_src = A; g_arot_T = T; g_arot_K = K;
+  }
+  return d_arot;
+}
+static inline const I4Plane* w4dec_plane(const char* name, const WEnt& w) {
+  if (!g_w4dec) return nullptr;
+  // mode 1: exactly the attention and GDN projections (fp8r-stored); modes 2 and 3: any resident twin
+  if (g_w4dec == 1 && !(strstr(name, ".self_attn.") || strstr(name, ".linear_attn."))) return nullptr;
+  (void)w;
+  return i4_plane(name);
+}
+// HALO_W4DEC=3 (W4A8-decode-all): int8 activation codes for k_gemm_w4a8, one
+// quantization per distinct (A, T, K) within a layer, like arot()
+static uint8_t* d_a8c = nullptr; static uint16_t* d_a8s = nullptr;   // [16][INTM] codes, [16][INTM/256] scales
+static void a8q(const uint16_t* A, int T, int K) {
+  if (A != g_a8_src || T != g_a8_T || K != g_a8_K) {
+    w4a8::k_actq8_emit<<<dim3(16, (unsigned)(K / 256)), 256>>>(A, d_a8c, d_a8s, T, K);
+    g_a8_src = A; g_a8_T = T; g_a8_K = K;
+  }
+}
+static void w4a8_gemm(const uint16_t* A, const I4Plane* p, uint16_t* C, int T, int N, int K) {
+  a8q(A, T, K);
+  int rc = w4a8::gemm_w4a8_launch(d_a8c, d_a8s, p->c, p->s, C, T, N, K, false, nullptr);
+  if (rc != 0) { fprintf(stderr, "w4a8: launch failed (%d) N %d K %d T %d\n", rc, N, K, T); exit(1); }
+}
 static inline bool gemv_vec_ok(const void* base, long rowstride, int K) {
   return g_gemv_vec && (K % 16) == 0 && (rowstride % 16) == 0 && (((uintptr_t)base) & 15u) == 0;
 }
@@ -1102,6 +1236,13 @@ static bool gemv_dq(const uint16_t* A, const char* name, uint16_t* C) {  if (!d_
   auto it = g_wmap.find(name);
   if (it == g_wmap.end()) return false;
   const WEnt& w = it->second;
+  if (const I4Plane* p = w4dec_plane(name, w)) {
+    if (g_w4dec == 3) { w4a8_gemm(A, p, C, 1, (int)w.rows, (int)w.cols); return true; }
+    const uint16_t* R = arot(A, 1, (int)w.cols);
+    if (g_gemv_vec >= 2) k_gemv_i4l_vec<1><<<dim3((unsigned)w.rows), 256>>>(R, p->c, p->s, C, (int)w.cols);
+    else                 k_gemv_i4l_vec<0><<<dim3((unsigned)w.rows), 256>>>(R, p->c, p->s, C, (int)w.cols);
+    return true;
+  }
   if (w.dt == 5) {
     const long rs = w.cols / 2 + w.cols / 16;
     if (gemv_vec_ok(d_wpool + w.off + 64, rs, (int)w.cols) && (((uintptr_t)A) & 15u) == 0) {
@@ -1135,13 +1276,29 @@ static bool gemv_dq(const uint16_t* A, const char* name, uint16_t* C) {  if (!d_
 static uint8_t* d_lmhead_q = nullptr;   // HALO_LMHEAD_FP8=1: raw fp8r codes [VOC][HID]
 static uint16_t* d_lmhead_s = nullptr;  // and the bf16 row scales [VOC]
 static int g_verify = 0;
+// DFlash2 (dflash2.h, included later): forward() captures the residual stream
+// after these target layers for every row when g_df_capture is set.
+static int g_df_capture = 0;
+static uint16_t* d_df_aux = nullptr;                 // [5][TMAX][HID]
+static int g_df_tl[5] = {5, 19, 33, 47, 61};
+static inline int df_layer_index(int l) {
+  for (int k = 0; k < 5; k++) if (g_df_tl[k] == l) return k;
+  return -1;
+}
 static float* d_logits_mr = nullptr;   // [8][VOC] verify logits
 static int* d_pred_mr = nullptr;       // [8]
 template<int P>
-static void gemv_dq_mr(const uint16_t* A, const WEnt& w, uint16_t* C) {
+static void gemv_dq_mr(const uint16_t* A, const char* name, const WEnt& w, uint16_t* C) {
   const int N = (int)w.rows, K = (int)w.cols;
   if (N % 4) { fprintf(stderr, "verify: %d rows not a multiple of 4\n", N); exit(1); }
   const bool nt = g_gemv_vec >= 2;
+  if (const I4Plane* p = w4dec_plane(name, w)) {
+    if (g_w4dec == 3) { w4a8_gemm(A, p, C, P, N, K); return; }
+    const uint16_t* R = arot(A, P, K);
+    if (nt) k_gemv_dq_vec_mr<2, P, 1><<<dim3((unsigned)N / 4), 256>>>(R, p->c, p->s, nullptr, (long)K / 2, C, K, N);
+    else    k_gemv_dq_vec_mr<2, P, 0><<<dim3((unsigned)N / 4), 256>>>(R, p->c, p->s, nullptr, (long)K / 2, C, K, N);
+    return;
+  }
   if (w.dt == 5) {
     const long rs = w.cols / 2 + w.cols / 16;
     if (nt) k_gemv_dq_vec_mr<1, P, 1><<<dim3((unsigned)N / 4), 256>>>(A, d_wpool + w.off + 64, nullptr, (const float*)(d_wpool + w.off), rs, C, K, N);
@@ -1158,16 +1315,29 @@ static bool gemv_dq_rows(const uint16_t* A, int T, const char* name, uint16_t* C
   if (it == g_wmap.end()) return false;
   const WEnt& w = it->second;
   switch (T) {
-    case 2: gemv_dq_mr<2>(A, w, C); break;
-    case 3: gemv_dq_mr<3>(A, w, C); break;
-    case 4: gemv_dq_mr<4>(A, w, C); break;
-    case 5: gemv_dq_mr<5>(A, w, C); break;
-    case 6: gemv_dq_mr<6>(A, w, C); break;
-    case 7: gemv_dq_mr<7>(A, w, C); break;
-    case 8: gemv_dq_mr<8>(A, w, C); break;
+    case 2: gemv_dq_mr<2>(A, name, w, C); break;
+    case 3: gemv_dq_mr<3>(A, name, w, C); break;
+    case 4: gemv_dq_mr<4>(A, name, w, C); break;
+    case 5: gemv_dq_mr<5>(A, name, w, C); break;
+    case 6: gemv_dq_mr<6>(A, name, w, C); break;
+    case 7: gemv_dq_mr<7>(A, name, w, C); break;
+    case 8: gemv_dq_mr<8>(A, name, w, C); break;
     default: fprintf(stderr, "verify: unsupported row count %d\n", T); exit(1);
   }
   return true;
+}
+static void ab_gemv_rows(const uint16_t* A, const uint16_t* W, uint16_t* C, int T) {
+  switch (T) {
+    case 2: k_gemv_bf16_bf16out_rows<2><<<HV, 256>>>(A, W, C, HID, HV); break;
+    case 3: k_gemv_bf16_bf16out_rows<3><<<HV, 256>>>(A, W, C, HID, HV); break;
+    case 4: k_gemv_bf16_bf16out_rows<4><<<HV, 256>>>(A, W, C, HID, HV); break;
+    case 5: k_gemv_bf16_bf16out_rows<5><<<HV, 256>>>(A, W, C, HID, HV); break;
+    case 6: k_gemv_bf16_bf16out_rows<6><<<HV, 256>>>(A, W, C, HID, HV); break;
+    case 7: k_gemv_bf16_bf16out_rows<7><<<HV, 256>>>(A, W, C, HID, HV); break;
+    case 8: k_gemv_bf16_bf16out_rows<8><<<HV, 256>>>(A, W, C, HID, HV); break;
+    default:
+      for (int r = 0; r < T; r++) k_gemv_bf16_bf16out_vec<<<HV, 256>>>(A + (long)r * HID, W, C + (long)r * HV, HID);
+  }
 }
 static void lmhead_mr(const uint16_t* A, int T) {
   switch (T) {
@@ -1204,6 +1374,7 @@ static uint16_t *d_g17, *d_u17, *d_act;
 static float *d_scores, *d_logits;
 static uint16_t *d_pbf;
 static int *d_tok, *d_tgt, *d_pred;
+static int* d_drafts = nullptr;   // [8] device-side draft chain
 static float *d_nll;
 
 // host
@@ -1225,12 +1396,20 @@ static int spec_maxg() {
     const char* m = getenv("HALO_MTP");
     const char* g = getenv("HALO_SPEC_MAXG");
     v = (m && atoi(m) == 1) ? (g ? atoi(g) : 4) : 0;
+    const char* df = getenv("HALO_DFLASH");
+    if (df && atoi(df) == 1 && v < 7) v = 7;   // DFlash2 verifies a block of 8 rows
     if (v < 0) v = 0;
     if (v > 7) v = 7;
   }
   return v;
 }
 static inline int ring_ns() { return spec_maxg() > 0 ? spec_maxg() + 2 : 1; }
+// MTP drafts per round (HALO_SPEC_MAXG, default 4), independent of the ring size
+static int mtp_gamma() {
+  static int v = -1;
+  if (v < 0) { const char* g = getenv("HALO_SPEC_MAXG"); v = g ? atoi(g) : 4; if (v < 1) v = 1; if (v > 7) v = 7; }
+  return v;
+}
 static inline float* ring_S(int k) { return d_S_ring + (size_t)((g_ring_cur + k) % g_ring_ns) * kSlotS; }
 static inline uint16_t* ring_conv(int k) { return d_conv_ring + (size_t)((g_ring_cur + k) % g_ring_ns) * kSlotConv; }
 static inline void ring_set(int cur) {
@@ -1249,6 +1428,14 @@ extern "C" int chlorine_gdn_step_io(const uint16_t* qkv, const float* G, const f
                                     int dnprep, float qscale, int sync);
 extern "C" int chlorine_attention_decode_splitk(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
                                                 uint16_t* O, int pos_base);
+// verify pass, HALO_VERIFY_MERGE=1: T query rows at pos_base..pos_base+T-1 in
+// one launch pair, row r bit-identical to the single-row call at pos_base+r
+extern "C" int chlorine_attention_decode_splitk_rows(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
+                                                     uint16_t* O, int pos_base, int T);
+struct GdnSlots { float* p[9]; };
+// T sequential GDN steps in one launch: row r reads slot p[r], writes p[r+1]
+extern "C" int chlorine_gdn_step_rows(const uint16_t* qkv, const float* G, const float* B,
+                                      GdnSlots slots, int T, uint16_t* out, int dnprep, float qscale, int sync);
 static int g_attn_splitk = 0;          // HALO_ATTN_SPLITK=1: flash-decoding kernel for T == 1
 static int g_splitk_real_checked = 0;
 static bool g_prefill_async = false;
@@ -1555,18 +1742,32 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     int fa = (l % 4 == 3);
     int gi = fa ? fa_ord(l) : gdn_ord(l);
     bool fused = ((T == 1 || g_verify) && d_wpool);   // decode step: fused dequant-GEMV, no dequanted W
+    arot_reset();
     int w4 = g_actq && T >= 64 && d_wc[0] && gate_dt5(l);
+    const bool i4 = g_w4a4 && !fused && T >= 64 && !w4;
+    const uint16_t* i4_lastA = nullptr; int i4_lastK = 0;
+    // activation quantization once per distinct input tensor of this layer
+    auto proj = [&](const uint16_t* A, const char* name, const uint16_t* W, uint16_t* C, int N, int K) {
+      const I4Plane* p = i4 ? i4_plane(name) : nullptr;
+      if (!p) { gemm(A, W, C, T, N, K); return; }
+      if (A != i4_lastA || K != i4_lastK) {
+        k_actq_emit<<<dim3(T, K / 256), 256>>>(A, d_qc, d_qs, K);
+        i4_lastA = A; i4_lastK = K;
+      }
+      int rc = gemm_i4_launch(d_qc, d_qs, p->c, p->s, C, T, N, K, nullptr);
+      if (rc != 0) { fprintf(stderr, "w4a4: gemm_i4_launch failed for %s (%d)\n", name, rc); exit(1); }
+    };
     // ---- load weights for this layer (or fused from the pool) ----
     if (fa) {
       if (!fused) {
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l);  getw(nm, QH * HD * 2, HID, d_q);
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l);  getw(nm, KVH * HD, HID, d_k);
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l);  getw(nm, KVH * HD, HID, d_v);
-        snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l);  getw(nm, HID, QH * HD, d_o);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l);  getw_i4(nm, QH * HD * 2, HID, d_q, i4);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l);  getw_i4(nm, KVH * HD, HID, d_k, i4);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l);  getw_i4(nm, KVH * HD, HID, d_v, i4);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l);  getw_i4(nm, HID, QH * HD, d_o, i4);
       }
     } else {
       if (!fused) {
-        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); getw(nm, QKVW, HID, d_qkv);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); getw_i4(nm, QKVW, HID, d_qkv, i4);
         { const char* dp = getenv("HALO_DUMP_WQ");
           if (dp && l == 0) { CK(hipDeviceSynchronize()); void* hb = malloc((long)QKVW * HID * 2);
             CK(hipMemcpy(hb, d_qkv, (long)QKVW * HID * 2, hipMemcpyDeviceToHost));
@@ -1574,8 +1775,8 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
           if (getenv("HALO_DEQ_DBG") && l == 0) {
             uint16_t v; CK(hipMemcpy(&v, d_qkv + 5L * HID + 16, 2, hipMemcpyDeviceToHost));
             printf("[ours qkv(5,16)] = %u (%f)\n", (unsigned)v, h_bf16f(v)); } }
-        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   getw(nm, HV * DV, HID, d_z);
-        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l);    getw(nm, HID, HV * DV, d_outp);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   getw_i4(nm, HV * DV, HID, d_z, i4);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l);    getw_i4(nm, HID, HV * DV, d_outp, i4);
       }
     }
     if (!fused) {
@@ -1587,9 +1788,9 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight.i4l", l);
         load_i4l_raw(nm, HID, INTM, 2);
       } else {
-        snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); getw(nm, INTM, HID, d_gate);
-        snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   getw(nm, INTM, HID, d_up);
-        snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); getw(nm, HID, INTM, d_down);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); getw_i4(nm, INTM, HID, d_gate, i4);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   getw_i4(nm, INTM, HID, d_up, i4);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); getw_i4(nm, HID, INTM, d_down, i4);
       }
       if (!g_prefill_async) CK(hipDeviceSynchronize());
     }
@@ -1632,22 +1833,31 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   gemv_dq_rows(d_ln1, T, nm, d_zout);
         }
       } else {
-        gemm(d_ln1, d_qkv, d_qkvraw, T, QKVW, HID);
-        gemm(d_ln1, d_z, d_zout, T, HV * DV, HID);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); proj(d_ln1, nm, d_qkv, d_qkvraw, QKVW, HID);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   proj(d_ln1, nm, d_z, d_zout, HV * DV, HID);
       } }
-      if (g_verify) {
+      if (g_verify && g_verify_merge) {
+        ConvSlots cs;
+        for (int r = 0; r <= T; r++) cs.p[r] = ring_conv(r) + (long)gi * QKVW * 3;
+        k_conv1d_step_rows<<<QKVW / 256, 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc, cs, T);
+      } else if (g_verify) {
         for (int r = 0; r < T; r++)
           k_conv1d_step_io<<<QKVW / 256, 256>>>(d_qkvraw + (long)r * QKVW, d_gdn_conv + (long)gi * QKVW * 4,
                                                 d_qkvc + (long)r * QKVW,
                                                 ring_conv(r) + (long)gi * QKVW * 3, ring_conv(r + 1) + (long)gi * QKVW * 3);
       } else if (T > 1) {
-        k_conv1d<<<GRID1((long)T * QKVW), 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc, T);
+        k_conv1d<<<GRID1((long)T * QKVW), 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc, T,
+                                                 d_convstate + (long)gi * QKVW * 3);
         k_conv_setstate<<<QKVW / 256, 256>>>(d_qkvraw, d_convstate + (long)gi * QKVW * 3, T);
       } else {
         k_conv1d_step<<<QKVW / 256, 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc,
                                            d_convstate + (long)gi * QKVW * 3);
       }
-      if (fused && g_ab_gemv) {
+      if (fused && g_ab_gemv && g_verify && g_verify_merge && T > 1) {
+        // one pass over the a/b weights for all verify rows (per row bit-identical)
+        ab_gemv_rows(d_ln1, d_gdn_a + (long)gi * HV * HID, d_ab_a, T);
+        ab_gemv_rows(d_ln1, d_gdn_b + (long)gi * HV * HID, d_ab_b, T);
+      } else if (fused && g_ab_gemv) {
         // HALO_AB_GEMV=1: two 48-row GEMVs instead of two hipBLASLt M=1 calls
         for (int r = 0; r < T; r++) {
           k_gemv_bf16_bf16out_vec<<<HV, 256>>>(d_ln1 + (long)r * HID, d_gdn_a + (long)gi * HV * HID, d_ab_a + (long)r * HV, HID);
@@ -1679,7 +1889,11 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         k_gdn_gates<<<GRID1((long)T * HV), 256>>>(d_ab_a, d_ab_b, d_alog + (long)gi * HV,
                                                   d_dtbias + (long)gi * HV, d_gateG, d_gateB, (long)T * HV);
         int gr = 0;
-        if (g_verify) {
+        if (g_verify && g_verify_merge) {
+          GdnSlots gs;
+          for (int r = 0; r <= T; r++) gs.p[r] = ring_S(r) + ((long)gi * HV) * DK * DV;
+          gr = chlorine_gdn_step_rows(d_qkvc, d_gateG, d_gateB, gs, T, d_co, g_dnprep, h_qscale, g_prefill_async ? 0 : 1);
+        } else if (g_verify) {
           for (int r = 0; r < T && gr == 0; r++)
             gr = chlorine_gdn_step_io(d_qkvc + (long)r * QKVW, d_gateG + (long)r * HV, d_gateB + (long)r * HV,
                                       ring_S(r) + ((long)gi * HV) * DK * DV, ring_S(r + 1) + ((long)gi * HV) * DK * DV,
@@ -1751,7 +1965,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       if (fused) {
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l); gemv_dq_rows(d_gn, T, nm, d_tmp1);
       } else {
-        gemm(d_gn, d_outp, d_tmp1, T, HID, HV * DV);
+        snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l); proj(d_gn, nm, d_outp, d_tmp1, HID, HV * DV);
       }
       if (g_dbg) { dbg_all("zout", d_zout, T, HV * DV); dbg_all("gn", d_gn, T, HV * DV); dbg_all("gdn_attnout", d_tmp1, T, HID); }
       if (getenv("HALO_TIME")) printf("  L%d gdn load %.2fs scan %.3fs\n", l, tload, tscan);
@@ -1762,9 +1976,9 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
         snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l);  gemv_dq_rows(d_ln1, T, nm, d_kk);
         snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l);  gemv_dq_rows(d_ln1, T, nm, d_vv);
       } else {
-        gemm(d_ln1, d_q, d_qg, T, QH * HD * 2, HID);
-        gemm(d_ln1, d_k, d_kk, T, KVH * HD, HID);
-        gemm(d_ln1, d_v, d_vv, T, KVH * HD, HID);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l); proj(d_ln1, nm, d_q, d_qg, QH * HD * 2, HID);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l); proj(d_ln1, nm, d_k, d_kk, KVH * HD, HID);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l); proj(d_ln1, nm, d_v, d_vv, KVH * HD, HID);
       }
       k_headnorm<<<GRID1((long)T * QH), 256>>>(d_qg, d_qnorm + (long)gi * HD, d_qn, T, QH, QH * HD * 2, HD * 2, HD);
       k_headnorm<<<GRID1((long)T * KVH), 256>>>(d_kk, d_knorm + (long)gi * HD, d_kn, T, KVH, KVH * HD, HD, HD);
@@ -1775,7 +1989,9 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_kn, kc, T, pos_base);
       k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_vv, vc, T, pos_base);
       // KV is written at pos_base+t before this. Query t attends keys 0..pos_base+t.
-      if (g_verify) {
+      if (g_verify && g_verify_merge && g_flash && g_attn_splitk && g_splitk_real_checked && g_flash_real_checked) {
+        CK((hipError_t)chlorine_attention_decode_splitk_rows(d_qn, kc, vc, d_att, pos_base, T));
+      } else if (g_verify) {
         for (int r = 0; r < T; r++)
           attention(d_qn + (long)r * QH * HD, kc, vc, d_att + (long)r * QH * HD, 1, pos_base + r, l);
       } else {
@@ -1785,7 +2001,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       if (fused) {
         snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l); gemv_dq_rows(d_att, T, nm, d_tmp1);
       } else {
-        gemm(d_att, d_o, d_tmp1, T, HID, QH * HD);
+        snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l); proj(d_att, nm, d_o, d_tmp1, HID, QH * HD);
       }
       if (g_dbg) dbg_all("q_rope", d_qn, T, QH * HD);
     }
@@ -1816,8 +2032,8 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); gemv_dq_rows(d_ln2, T, nm, d_g17);
       snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   gemv_dq_rows(d_ln2, T, nm, d_u17);
     } else {
-      gemm(d_ln2, d_gate, d_g17, T, INTM, HID);
-      gemm(d_ln2, d_up, d_u17, T, INTM, HID);
+      snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); proj(d_ln2, nm, d_gate, d_g17, INTM, HID);
+      snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   proj(d_ln2, nm, d_up, d_u17, INTM, HID);
     }
     if (g_dbg) { dbg_all("g17", d_g17, T, INTM); dbg_all("u17", d_u17, T, INTM); }
     k_silu_mul<<<GRID1((long)T * INTM), 256>>>(d_g17, d_u17, d_act, (long)T * INTM);
@@ -1827,10 +2043,14 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     } else if (fused) {
       snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); gemv_dq_rows(d_act, T, nm, d_tmp1);
     } else {
-      gemm(d_act, d_down, d_tmp1, T, HID, INTM);
+      snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); proj(d_act, nm, d_down, d_tmp1, HID, INTM);
     }
     if (g_dbg) { dbg_all("mlp_act", d_act, T, INTM); dbg_all("mlp_out", d_tmp1, T, HID); }
     k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
+    if (g_df_capture) {           // DFlash2: residual stream after this layer, all T rows
+      const int k = df_layer_index(l);
+      if (k >= 0) CK(hipMemcpyAsync(d_df_aux + (size_t)k * TMAX * HID, d_x, (size_t)T * HID * 2, hipMemcpyDeviceToDevice, 0));
+    }
     if (!g_prefill_async) CK(hipDeviceSynchronize());
     if (g_dbg) { printf("after L%d (%s):\n", l, fa ? "fa" : "gdn"); dbg_all("x", d_x, T, HID); }
     if (getenv("HALO_TIME")) printf("  L%d load %.2fs compute %.2fs\n", l, tload, now_s() - tc);
@@ -1995,7 +2215,8 @@ static void mproj(const uint16_t* A, const uint16_t* W, uint16_t* C, int T, int 
 // at position pos0 + t and writes the MTP KV entry for that position. With
 // want_logits the last row's logits go to d_logits and its argmax to d_pred.
 // Leaves the final-normed MTP hidden of the last row in d_mtp_hout.
-static void mtp_rows(const uint16_t* h, const int* ids, int T, int pos0, bool want_logits) {
+static void mtp_rows(const uint16_t* h, const int* ids, int T, int pos0, bool want_logits, int* pred_out = nullptr) {
+  if (!pred_out) pred_out = d_pred;
   k_embed<<<GRID1((long)T * HID), 256>>>(ids, d_embed, d_x, HID);
   k_rmsnorm<<<T, 256>>>(d_x, d_mn_e, d_ln2, HID, T, 1);
   k_rmsnorm<<<T, 256>>>(h, d_mn_h, d_tmp1, HID, T, 1);
@@ -2026,12 +2247,46 @@ static void mtp_rows(const uint16_t* h, const int* ids, int T, int pos0, bool wa
   if (want_logits) {
     if (d_draft_map) {
       k_gemv_lmhead_fp8r_vec_map<<<g_draft_nv, 256>>>(d_mtp_hout, d_lmhead_q, d_lmhead_s, d_draft_map, d_logits, HID);
-      k_argmax_prob<<<1, 256>>>(d_logits, g_draft_nv, d_draft_map, d_pred, d_draft_prob);
+      k_argmax_prob<<<1, 256>>>(d_logits, g_draft_nv, d_draft_map, pred_out, d_draft_prob);
     } else {
       k_gemv_lmhead_fp8r_vec<<<VOC, 256>>>(d_mtp_hout, d_lmhead_q, d_lmhead_s, d_logits, HID);
-      k_argmax_prob<<<1, 256>>>(d_logits, VOC, nullptr, d_pred, d_draft_prob);
+      k_argmax_prob<<<1, 256>>>(d_logits, VOC, nullptr, pred_out, d_draft_prob);
     }
   }
+}
+
+static void init_i4_planes() {
+  double t0 = now_s();
+  bool ok = true;
+  for (int l = 0; l < NL && ok; l++) {
+    const bool fa = (l % 4 == 3);
+    // mode 3 (W4A4-ffn-out): the FFN and the output projections only; the
+    // projections that feed the attention and the GDN recurrence stay bf16
+    if (g_w4a4 == 1 || g_w4dec >= 1) {
+      if (fa) {
+        ok &= i4_add((snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l), nm), QH * HD * 2, HID);
+        ok &= i4_add((snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l), nm), KVH * HD, HID);
+        ok &= i4_add((snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l), nm), KVH * HD, HID);
+      } else {
+        ok &= i4_add((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l), nm), QKVW, HID);
+        ok &= i4_add((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l), nm), HV * DV, HID);
+      }
+    }
+    if (g_w4a4 == 1 || g_w4a4 == 3 || g_w4dec >= 1) {
+      if (fa) ok &= i4_add((snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l), nm), HID, QH * HD);
+      else    ok &= i4_add((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l), nm), HID, HV * DV);
+    }
+    if (g_w4a4 == 1 || g_w4a4 == 3 || g_w4dec >= 2 || (g_w4a4 == 2 && gate_dt5(l))) {
+      ok &= i4_add((snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l), nm), INTM, HID);
+      ok &= i4_add((snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l), nm), INTM, HID);
+      ok &= i4_add((snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l), nm), HID, INTM);
+    }
+  }
+  if (!ok) { fprintf(stderr, "w4a4: plane load failed\n"); exit(1); }
+  fprintf(stderr, "w4a4: %zu .i4l planes resident (%.2f GB, %.1fs), prefill mode %d (%s), decode mode %d (%s)\n",
+          g_i4map.size(), g_i4_bytes / 1e9, now_s() - t0, g_w4a4,
+          g_w4a4 == 1 ? "W4A4-all-400, gemm_i4_launch for T >= 64" : g_w4a4 == 2 ? "W4A4-ffn-q4c" : g_w4a4 == 3 ? "W4A4-ffn-out" : "bf16 prefill",
+          g_w4dec, g_w4dec == 1 ? "W4-decode-attn-gdn (attention/GDN projections int4, MLP q4c)" : g_w4dec == 2 ? "W4-decode-all" : g_w4dec == 3 ? "W4A8-decode-all (int8 activations, iu8 WMMA)" : "bf16-exact decode");
 }
 
 // ================= engine API (used by the server and the harness) =================
@@ -2050,6 +2305,160 @@ static void trunk_reset_states() {
   memset(h_S, 0, (size_t)48 * HV * DK * DV * 4);
   if (d_S) CK(hipMemset(d_S, 0, (size_t)48 * HV * DK * DV * 4));
 }
+
+// ================= prompt-prefix cache (phase 5) =================
+// A cold prefill runs in fixed chunks of g_pf_chunk rows (HALO_PREFILL_CHUNK,
+// default 2048 when the cache is on). After the chunk that ends at the largest
+// multiple B of the chunk size with B <= n_prompt - 1, the state after B tokens
+// is copied into a cache entry: KV rows [0, B) of the 16 attention layers, the
+// live GDN state slot, the conv history, the MTP KV rows and the last hidden.
+// A later prompt whose first B ids equal the entry's ids restores that copy
+// and prefills only the suffix, in the same chunk shapes as a cold run, so the
+// suffix rows see the same GEMM shapes and the same recurrence boundaries.
+// Snapshots never alias the live state; speculative rollback mutates only the
+// live rings.
+#include "dflash2.h"
+
+struct CacheEntry {
+  std::vector<int> ids;
+  int B = 0;
+  uint16_t* kc = nullptr; uint16_t* vc = nullptr;   // [16][B][KVH][HD]
+  float* S = nullptr;                               // one slot
+  uint16_t* conv = nullptr;                         // [48][QKVW][3]
+  uint16_t* mkc = nullptr; uint16_t* mvc = nullptr; // MTP KV [B][KVH][HD], when MTP is loaded
+  uint16_t* dkc = nullptr; uint16_t* dvc = nullptr; // DFlash2 context K/V [L][B][NKV][HD], when loaded
+  uint16_t* hlast = nullptr;                        // trunk final-normed hidden of position B-1
+  uint64_t last_use = 0;
+};
+static std::vector<CacheEntry> g_cache;
+static int g_cache_max = 0, g_pf_chunk = 0;
+static uint64_t g_cache_tick = 0;
+static long g_cs_hits = 0, g_cs_misses = 0, g_cs_stores = 0, g_cs_evicted = 0, g_cs_tokens_saved = 0, g_cs_refused = 0;
+static double g_cs_store_ms = 0, g_cs_restore_ms = 0, g_cs_last_store_ms = 0, g_cs_last_restore_ms = 0;
+static size_t cache_entry_bytes(const CacheEntry& ce) {
+  size_t b = (size_t)16 * ce.B * KVH * HD * 2 * 2 + kSlotS * 4 + kSlotConv * 2 + (size_t)HID * 2;
+  if (ce.mkc) b += (size_t)ce.B * KVH * HD * 2 * 2;
+  if (ce.dkc) b += (size_t)DF_L * ce.B * DF_KW * 2 * 2;
+  return b;
+}
+static size_t cache_bytes() { size_t b = 0; for (auto& e : g_cache) b += cache_entry_bytes(e); return b; }
+static void cache_free(CacheEntry& ce) {
+  if (ce.kc) (void)hipFree(ce.kc); if (ce.vc) (void)hipFree(ce.vc); if (ce.S) (void)hipFree(ce.S); if (ce.conv) (void)hipFree(ce.conv);
+  if (ce.mkc) (void)hipFree(ce.mkc); if (ce.mvc) (void)hipFree(ce.mvc); if (ce.hlast) (void)hipFree(ce.hlast);
+  if (ce.dkc) (void)hipFree(ce.dkc); if (ce.dvc) (void)hipFree(ce.dvc);
+  ce = CacheEntry{};
+}
+static void cache_init() {
+  const char* c = getenv("HALO_CACHE_ENTRIES");
+  g_cache_max = c ? atoi(c) : 0;
+  const char* p = getenv("HALO_PREFILL_CHUNK");
+  g_pf_chunk = p ? atoi(p) : (g_cache_max > 0 ? 2048 : 0);
+  if (g_pf_chunk % 64) { fprintf(stderr, "HALO_PREFILL_CHUNK must be a multiple of 64\n"); exit(1); }
+  if (g_cache_max > 0)
+    fprintf(stderr, "prompt cache: up to %d entries, prefix boundary aligned to %d tokens\n", g_cache_max, g_pf_chunk);
+}
+// longest cached prefix of prompt[0..n) at an aligned boundary <= n-1
+static CacheEntry* cache_lookup(const int* prompt, int n) {
+  CacheEntry* best = nullptr;
+  for (auto& e : g_cache)
+    if (e.B <= n - 1 && (!best || e.B > best->B) && memcmp(e.ids.data(), prompt, (size_t)e.B * 4) == 0) best = &e;
+  return best;
+}
+// copy the live state after B tokens into a (new or evicted) entry
+static void cache_store(const int* prompt, int B) {
+  double t0 = now_s();
+  for (auto& x : g_cache) if (x.B == B && memcmp(x.ids.data(), prompt, (size_t)B * 4) == 0) return;   // already cached
+  CacheEntry ce;
+  ce.B = B; ce.ids.assign(prompt, prompt + B);
+  size_t kvb = (size_t)16 * B * KVH * HD * 2;
+  if (hipMalloc((void**)&ce.kc, kvb) != hipSuccess || hipMalloc((void**)&ce.vc, kvb) != hipSuccess ||
+      hipMalloc((void**)&ce.S, kSlotS * 4) != hipSuccess || hipMalloc((void**)&ce.conv, kSlotConv * 2) != hipSuccess ||
+      hipMalloc((void**)&ce.hlast, (size_t)HID * 2) != hipSuccess ||
+      (g_mtp_ok && (hipMalloc((void**)&ce.mkc, (size_t)B * KVH * HD * 2) != hipSuccess ||
+                    hipMalloc((void**)&ce.mvc, (size_t)B * KVH * HD * 2) != hipSuccess)) ||
+      (g_df_ok && (hipMalloc((void**)&ce.dkc, (size_t)DF_L * B * DF_KW * 2) != hipSuccess ||
+                   hipMalloc((void**)&ce.dvc, (size_t)DF_L * B * DF_KW * 2) != hipSuccess))) {
+    cache_free(ce); g_cs_refused++; return;
+  }
+  for (int l = 0; l < 16; l++) {
+    CK(hipMemcpy(ce.kc + (size_t)l * B * KVH * HD, d_kcache + (size_t)l * CXT * KVH * HD, (size_t)B * KVH * HD * 2, hipMemcpyDeviceToDevice));
+    CK(hipMemcpy(ce.vc + (size_t)l * B * KVH * HD, d_vcache + (size_t)l * CXT * KVH * HD, (size_t)B * KVH * HD * 2, hipMemcpyDeviceToDevice));
+  }
+  CK(hipMemcpy(ce.S, d_S, kSlotS * 4, hipMemcpyDeviceToDevice));
+  CK(hipMemcpy(ce.conv, d_convstate, kSlotConv * 2, hipMemcpyDeviceToDevice));
+  CK(hipMemcpy(ce.hlast, d_ln1 + (size_t)(B - 1 - (B - g_pf_chunk)) * HID, (size_t)HID * 2, hipMemcpyDeviceToDevice));
+  if (ce.dkc) for (int l = 0; l < DF_L; l++) {
+    CK(hipMemcpy(ce.dkc + (size_t)l * B * DF_KW, d_df_kc + (size_t)l * CXT * DF_KW, (size_t)B * DF_KW * 2, hipMemcpyDeviceToDevice));
+    CK(hipMemcpy(ce.dvc + (size_t)l * B * DF_KW, d_df_vc + (size_t)l * CXT * DF_KW, (size_t)B * DF_KW * 2, hipMemcpyDeviceToDevice));
+  }
+  if (ce.mkc) {
+    CK(hipMemcpy(ce.mkc, d_mkc, (size_t)B * KVH * HD * 2, hipMemcpyDeviceToDevice));
+    CK(hipMemcpy(ce.mvc, d_mvc, (size_t)B * KVH * HD * 2, hipMemcpyDeviceToDevice));
+  }
+  CK(hipDeviceSynchronize());
+  if ((int)g_cache.size() >= g_cache_max) {
+    size_t victim = 0;
+    for (size_t i = 1; i < g_cache.size(); i++) if (g_cache[i].last_use < g_cache[victim].last_use) victim = i;
+    cache_free(g_cache[victim]); g_cache.erase(g_cache.begin() + (long)victim); g_cs_evicted++;
+  }
+  ce.last_use = ++g_cache_tick;
+  g_cache.push_back(ce);
+  g_cs_stores++;
+  g_cs_last_store_ms = (now_s() - t0) * 1000.0; g_cs_store_ms += g_cs_last_store_ms;
+}
+static void cache_restore(CacheEntry& ce) {
+  double t0 = now_s();
+  const int B = ce.B;
+  for (int l = 0; l < 16; l++) {
+    CK(hipMemcpy(d_kcache + (size_t)l * CXT * KVH * HD, ce.kc + (size_t)l * B * KVH * HD, (size_t)B * KVH * HD * 2, hipMemcpyDeviceToDevice));
+    CK(hipMemcpy(d_vcache + (size_t)l * CXT * KVH * HD, ce.vc + (size_t)l * B * KVH * HD, (size_t)B * KVH * HD * 2, hipMemcpyDeviceToDevice));
+  }
+  CK(hipMemcpy(d_S, ce.S, kSlotS * 4, hipMemcpyDeviceToDevice));
+  CK(hipMemcpy(d_convstate, ce.conv, kSlotConv * 2, hipMemcpyDeviceToDevice));
+  if (ce.dkc && d_df_kc) for (int l = 0; l < DF_L; l++) {
+    CK(hipMemcpy(d_df_kc + (size_t)l * CXT * DF_KW, ce.dkc + (size_t)l * B * DF_KW, (size_t)B * DF_KW * 2, hipMemcpyDeviceToDevice));
+    CK(hipMemcpy(d_df_vc + (size_t)l * CXT * DF_KW, ce.dvc + (size_t)l * B * DF_KW, (size_t)B * DF_KW * 2, hipMemcpyDeviceToDevice));
+  }
+  if (ce.mkc && d_mkc) {
+    CK(hipMemcpy(d_mkc, ce.mkc, (size_t)B * KVH * HD * 2, hipMemcpyDeviceToDevice));
+    CK(hipMemcpy(d_mvc, ce.mvc, (size_t)B * KVH * HD * 2, hipMemcpyDeviceToDevice));
+  }
+  CK(hipDeviceSynchronize());
+  ce.last_use = ++g_cache_tick;
+  g_cs_hits++; g_cs_tokens_saved += B;
+  g_cs_last_restore_ms = (now_s() - t0) * 1000.0; g_cs_restore_ms += g_cs_last_restore_ms;
+}
+extern "C" int chlorine_trunk_cstat(char* buf, int cap) {
+  // entries, bytes, reserved, cap, hits, misses, stores, evicted, tokens_saved,
+  // store_ms, restore_ms, last_store_ms, last_restore_ms, refused
+  return snprintf(buf, (size_t)cap, "C %d %lld %lld %lld %ld %ld %ld %ld %ld %.1f %.1f %.1f %.1f %ld",
+                  (int)g_cache.size(), (long long)cache_bytes(), (long long)0, (long long)g_cache_max,
+                  g_cs_hits, g_cs_misses, g_cs_stores, g_cs_evicted, g_cs_tokens_saved,
+                  g_cs_store_ms, g_cs_restore_ms, g_cs_last_store_ms, g_cs_last_restore_ms, g_cs_refused);
+}
+// Prefill prompt[0..n) into the reset state, using the cache when enabled.
+// Returns the number of tokens served from the cache. Afterwards d_ln1 holds the
+// final-normed rows of the LAST chunk and d_logits the last row's logits.
+static int prefill_prompt(const int* prompt, int n, int* prefix_hidden_rows) {
+  int start = 0;
+  CacheEntry* hit = g_cache_max > 0 ? cache_lookup(prompt, n) : nullptr;
+  if (hit) { cache_restore(*hit); start = hit->B; }
+  else if (g_cache_max > 0) g_cs_misses++;
+  const int C = g_pf_chunk > 0 ? g_pf_chunk : n;
+  // boundary to snapshot: largest multiple of C that is <= n-1 and beyond the restored prefix
+  int snapB = g_cache_max > 0 && C > 0 ? ((n - 1) / C) * C : 0;
+  if (snapB <= start) snapB = 0;
+  for (int off = start; off < n; off += C) {
+    int T = std::min(C, n - off);
+    up(d_tok, prompt + off, (size_t)T * 4);
+    forward(d_tok, T, off, 1);
+    if (g_df_capture) df_ingest(off, T);
+    if (snapB && off + T == snapB) cache_store(prompt, snapB);
+  }
+  *prefix_hidden_rows = n - ((n - start - 1) / C) * C - start;   // rows of the last chunk present in d_ln1
+  return start;
+}
+
 
 static float gdn_rnd(uint32_t& rng) {
   rng = rng * 1664525u + 1013904223u;
@@ -2233,6 +2642,9 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   if (getenv("HALO_GEMV_VEC")) g_gemv_vec = atoi(getenv("HALO_GEMV_VEC"));
   if (getenv("HALO_ATTN_SPLITK")) g_attn_splitk = atoi(getenv("HALO_ATTN_SPLITK"));
   if (getenv("HALO_AB_GEMV")) g_ab_gemv = atoi(getenv("HALO_AB_GEMV"));
+  if (getenv("HALO_W4A4")) g_w4a4 = atoi(getenv("HALO_W4A4"));
+  if (getenv("HALO_W4DEC")) g_w4dec = atoi(getenv("HALO_W4DEC"));
+  if (getenv("HALO_VERIFY_MERGE")) g_verify_merge = atoi(getenv("HALO_VERIFY_MERGE"));
   if (getenv("HALO_DNPREP")) g_dnprep = atoi(getenv("HALO_DNPREP"));
   if (getenv("HALO_BETA32")) g_beta32 = atoi(getenv("HALO_BETA32"));
 
@@ -2388,6 +2800,10 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_tgt, TMAX * 4));
   CK(hipMalloc((void**)&d_pred, TMAX * 4));
   CK(hipMalloc((void**)&d_nll, TMAX * 4));
+  CK(hipMalloc((void**)&d_drafts, 64));
+  CK(hipMalloc((void**)&d_arot, (size_t)8 * INTM * 2));
+  CK(hipMalloc((void**)&d_a8c, (size_t)16 * INTM));
+  CK(hipMalloc((void**)&d_a8s, (size_t)16 * (INTM / 256) * 2));
 
   h_qkvbf = (uint16_t*)malloc((long)TMAX * QKVW * 2);
   h_abbf = (uint16_t*)malloc((long)TMAX * HV * 2);
@@ -2475,8 +2891,11 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   }
   attn_selfcheck();
   gdn_selfcheck();
-  init_bf16_weight_cache();
+  if (g_w4a4 || g_w4dec) init_i4_planes();
+  if (g_w4a4 != 1) init_bf16_weight_cache();   // all-400 int4 prefill has no use for the bf16 copies
   if (spec_maxg() > 0) mtp_load();
+  df_load();
+  cache_init();
   g_ready = 1;
   fprintf(stderr, "trunk: ready (%.1fs)\n", now_s() - t0);
   return 0;
@@ -2670,6 +3089,101 @@ extern "C" int chlorine_sample_host(const float* d_row, int* counts, unsigned in
 // decided each committed token ("LH <position> <hash>"). A speculative run and
 // a serial run of the same prompt must print identical lines: that is the
 // bit-identity test of the verify path.
+// Teacher-forced scoring for the W4A4 quality gate: prefill ids[0..n) once,
+// then for every position r in [n_prompt-1, n-1) compute the logits row from
+// the final-normed hidden states and report NLL of ids[r+1] and the argmax.
+// Uses the prefill path (int4 when HALO_W4A4 is set and n >= 64, bf16
+// otherwise), so two servers can be compared on the same continuation.
+static int* d_rowmap8 = nullptr;
+extern "C" int chlorine_trunk_score(const int* ids, int n, int n_prompt, float* nll_out, int* pred_out) {
+  if (!g_ready) return -1;
+  if (n < 2 || n > TMAX || n_prompt < 1 || n_prompt >= n) return -2;
+  if (!d_lmhead_q) return -3;   // needs HALO_LMHEAD_FP8=1 (multi-row lm_head reads the fp8r plane)
+  if (!d_rowmap8) { int rm[8] = {0, 1, 2, 3, 4, 5, 6, 7}; CK(hipMalloc((void**)&d_rowmap8, 32)); up(d_rowmap8, rm, 32); }
+  trunk_reset_states();
+  {
+    const int C = g_pf_chunk > 0 ? g_pf_chunk : n;
+    for (int off = 0; off < n; off += C) {
+      int T = std::min(C, n - off);
+      up(d_tok, ids + off, (size_t)T * 4);
+      forward(d_tok, T, off, 1);
+    }
+  }
+  {
+    const int C = g_pf_chunk > 0 ? g_pf_chunk : n;
+    const int first = ((n - 1) / C) * C;              // first row of the last chunk in d_ln1
+    if (n_prompt - 1 < first) return -4;              // continuation must lie inside the last chunk
+    ids += 0;
+  }
+  int scored = 0;
+  const int rowbase = g_pf_chunk > 0 ? ((n - 1) / g_pf_chunk) * g_pf_chunk : 0;
+  for (int r0 = n_prompt - 1; r0 < n - 1; r0 += 8) {
+    const int P = std::min(8, n - 1 - r0);
+    lmhead_mr(d_ln1 + (size_t)(r0 - rowbase) * HID, P);
+    up(d_tgt, ids + r0 + 1, (size_t)P * 4);
+    k_topnll<<<P, 256>>>(d_logits_mr, d_rowmap8, d_tgt, d_pred, d_nll, VOC, P);
+    CK(hipDeviceSynchronize());
+    CK(hipMemcpy(nll_out + scored, d_nll, (size_t)P * 4, hipMemcpyDeviceToHost));
+    CK(hipMemcpy(pred_out + scored, d_pred, (size_t)P * 4, hipMemcpyDeviceToHost));
+    scored += P;
+  }
+  return scored;
+}
+
+// SCORE through the decode path (HALO_SCORE_DECODE=1): the prompt rows go
+// through the prefill path as in serving, then every continuation position is
+// processed by the decode kernels, in verify chunks of up to 8 rows when the
+// state rings exist (HALO_MTP=1) or one serial step at a time otherwise. The
+// logits are therefore those of the decode GEMVs, which is what a decode
+// precision configuration (HALO_W4DEC) changes; the prefill-path SCORE above
+// is the gate for prefill configurations (HALO_W4A4).
+extern "C" int chlorine_trunk_score_decode(const int* ids, int n, int n_prompt, float* nll_out, int* pred_out) {
+  if (!g_ready) return -1;
+  if (n < 2 || n > CXT - 2 || n_prompt < 1 || n_prompt >= n) return -2;
+  if (!d_lmhead_q) return -3;
+  if (!d_rowmap8) { int rm[8] = {0, 1, 2, 3, 4, 5, 6, 7}; CK(hipMalloc((void**)&d_rowmap8, 32)); up(d_rowmap8, rm, 32); }
+  trunk_reset_states();
+  if (d_S_ring && d_conv_ring) ring_set(0);
+  {
+    const int C = g_pf_chunk > 0 ? g_pf_chunk : n_prompt;
+    for (int off = 0; off < n_prompt; off += C) {
+      int T = std::min(C, n_prompt - off);
+      up(d_tok, ids + off, (size_t)T * 4);
+      forward(d_tok, T, off, 1);
+    }
+  }
+  int scored = 0;
+  // position n_prompt-1: the prefill's last-row logits (as the first generated token in serving)
+  up(d_tgt, ids + n_prompt, 4);
+  k_topnll<<<1, 256>>>(d_logits, d_rowmap8, d_tgt, d_pred, d_nll, VOC, 1);
+  CK(hipDeviceSynchronize());
+  CK(hipMemcpy(nll_out + scored, d_nll, 4, hipMemcpyDeviceToHost));
+  CK(hipMemcpy(pred_out + scored, d_pred, 4, hipMemcpyDeviceToHost));
+  scored++;
+  const int maxrows = (d_S_ring && d_conv_ring && g_ring_ns > 1) ? std::min(8, g_ring_ns - 1) : 1;
+  for (int r0 = n_prompt; r0 < n - 1; ) {
+    const int P = std::min(maxrows, n - 1 - r0);
+    up(d_tok, ids + r0, (size_t)P * 4);
+    up(d_tgt, ids + r0 + 1, (size_t)P * 4);
+    if (P == 1 && maxrows == 1) {
+      forward(d_tok, 1, r0, 1);
+      k_topnll<<<1, 256>>>(d_logits, d_rowmap8, d_tgt, d_pred, d_nll, VOC, 1);
+    } else {
+      g_verify = 1;
+      forward(d_tok, P, r0, 1);
+      g_verify = 0;
+      k_topnll<<<P, 256>>>(d_logits_mr, d_rowmap8, d_tgt, d_pred, d_nll, VOC, P);
+      ring_set(g_ring_cur + P);      // accept every row
+    }
+    CK(hipDeviceSynchronize());
+    CK(hipMemcpy(nll_out + scored, d_nll, (size_t)P * 4, hipMemcpyDeviceToHost));
+    CK(hipMemcpy(pred_out + scored, d_pred, (size_t)P * 4, hipMemcpyDeviceToHost));
+    scored += P;
+    r0 += P;
+  }
+  return scored;
+}
+
 static int g_logit_hash = -1;
 static void logit_hash(const float* d_row, int pos) {
   if (g_logit_hash < 0) { const char* e = getenv("HALO_LOGIT_HASH"); g_logit_hash = e && atoi(e) == 1; }
@@ -2686,6 +3200,7 @@ static void logit_hash(const float* d_row, int pos) {
 struct chlorine_spec_stats {
   int drafter, rounds, proposed, accepted, committed;
   double draft_ms, verify_ms, ingest_ms, mtp_prefill_ms;
+  int n_cached;
 };
 
 extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long max_tokens,
@@ -2698,17 +3213,20 @@ extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long ma
   if (n_prompt < 1 || n_prompt > TMAX || n_prompt > CXT - 2 || max_tokens < 1 ||
       max_tokens > (long)(CXT - n_prompt)) return -2;
   bool sample = opts && opts->has_sample;
-  const bool spec = drafter == 1 && g_mtp_ok && !sample;
+  const bool dfl = drafter == 2 && g_df_ok && !sample;
+  const bool spec = (drafter == 1 && g_mtp_ok && !sample) || dfl;
+  g_df_capture = dfl ? 1 : 0;
   chlorine_spec_stats local{};
   if (!st) st = &local;
   *st = chlorine_spec_stats{};
-  st->drafter = spec ? 1 : 0;
+  st->drafter = dfl ? 2 : (spec ? 1 : 0);
   static std::vector<int> counts;
   counts.assign(VOC, 0);
   trunk_reset_states();
   double tp = now_s();
-  up(d_tok, prompt, (size_t)n_prompt * 4);
-  forward(d_tok, n_prompt, 0, 1);
+  int last_rows = n_prompt;
+  const int n_cached = prefill_prompt(prompt, n_prompt, &last_rows);
+  st->n_cached = n_cached;
   int tok = 0;
   float logp = 0.f;
   if (sample) {
@@ -2721,15 +3239,22 @@ extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long ma
     CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
     logit_hash(d_logits, n_prompt - 1);
   }
-  if (spec) {
+  if (spec && !dfl) {
     // MTP prompt ingest: position q (1..n-1) combines trunk hidden h[q-1]
     // with token q. The trunk's final norm left all prompt rows in d_ln1.
     double tm = now_s();
-    CK(hipMemcpy(d_mtp_hin, d_ln1, (size_t)n_prompt * HID * 2, hipMemcpyDeviceToDevice));
-    CK(hipMemcpy(d_hlast, d_ln1 + (size_t)(n_prompt - 1) * HID, (size_t)HID * 2, hipMemcpyDeviceToDevice));
-    if (n_prompt > 1) {
-      up(d_mtp_ids, prompt + 1, (size_t)(n_prompt - 1) * 4);
-      mtp_rows(d_mtp_hin, d_mtp_ids, n_prompt - 1, 1, false);
+    // d_ln1 holds the last prefill chunk (last_rows rows ending at n_prompt-1).
+    // MTP position q needs h[q-1] and token q: ingest positions max(1, first)..
+    // n_prompt-1 where first is the first row of that chunk plus one; with a
+    // cache hit the earlier MTP KV rows were restored with the entry.
+    const int first = n_prompt - last_rows;            // position of d_ln1 row 0
+    const int q0 = std::max(1, first + 1);
+    CK(hipMemcpy(d_hlast, d_ln1 + (size_t)(last_rows - 1) * HID, (size_t)HID * 2, hipMemcpyDeviceToDevice));
+    if (q0 <= n_prompt - 1) {
+      const int cnt = n_prompt - q0;
+      CK(hipMemcpy(d_mtp_hin, d_ln1 + (size_t)(q0 - 1 - first) * HID, (size_t)cnt * HID * 2, hipMemcpyDeviceToDevice));
+      up(d_mtp_ids, prompt + q0, (size_t)cnt * 4);
+      mtp_rows(d_mtp_hin, d_mtp_ids, cnt, q0, false);
     }
     CK(hipDeviceSynchronize());
     st->mtp_prefill_ms = (now_s() - tm) * 1000.0;
@@ -2747,7 +3272,7 @@ extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long ma
   };
   int n_proc = n_prompt;     // positions the trunk has processed
   bool more = commit(tok);
-  const int maxg = spec_maxg();
+  const int maxg = dfl ? DF_B - 1 : mtp_gamma();
   while (more) {
     const int remaining = (int)(max_tokens - n_gen);
     int gd = spec ? std::min(maxg, remaining - 1) : 0;
@@ -2777,6 +3302,26 @@ extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long ma
     static float pmin = -1.f;
     if (pmin < 0.f) { const char* e = getenv("HALO_SPEC_PMIN"); pmin = e ? (float)atof(e) : 0.f; }
     int nd = 0;
+    if (dfl) {
+      // DFlash2: one block forward drafts seven tokens from the anchor at n_proc
+      up(d_tok, &tk, 4);
+      df_draft(d_tok, n_proc);
+      CK(hipDeviceSynchronize());
+      CK(hipMemcpy(drafts, d_df_out, (size_t)(DF_B - 1) * 4, hipMemcpyDeviceToHost));
+      nd = gd;
+    } else if (pmin <= 0.f) {
+      // Device-side chain: draft j's argmax feeds draft j+1's embedding through
+      // d_drafts without a host round trip; one fence and one copy per round.
+      // Same kernels and values as the per-draft loop below.
+      up(d_mtp_ids, &tk, 4);
+      for (int j = 0; j < gd; j++) {
+        mtp_rows(hp, j == 0 ? d_mtp_ids : d_drafts + (j - 1), 1, n_proc + j, true, d_drafts + j);
+        hp = d_mtp_hout;
+      }
+      CK(hipDeviceSynchronize());
+      CK(hipMemcpy(drafts, d_drafts, (size_t)gd * 4, hipMemcpyDeviceToHost));
+      nd = gd;
+    } else
     for (int j = 0; j < gd; j++) {
       up(d_mtp_ids, &tk, 4);
       mtp_rows(hp, d_mtp_ids, 1, n_proc + j, true);
@@ -2809,13 +3354,17 @@ extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long ma
     for (int i = 0; i <= a; i++) logit_hash(d_logits_mr + (size_t)i * VOC, n_proc + i);
     double t2 = now_s();
     // ---- accept a drafts + the trunk's token v[a]; roll state to row a ----
-    CK(hipMemcpy(d_mtp_hin, d_ln1, (size_t)(a + 1) * HID * 2, hipMemcpyDeviceToDevice));
-    CK(hipMemcpy(d_hlast, d_ln1 + (size_t)a * HID, (size_t)HID * 2, hipMemcpyDeviceToDevice));
+    if (!dfl) {
+      CK(hipMemcpy(d_mtp_hin, d_ln1, (size_t)(a + 1) * HID * 2, hipMemcpyDeviceToDevice));
+      CK(hipMemcpy(d_hlast, d_ln1 + (size_t)a * HID, (size_t)HID * 2, hipMemcpyDeviceToDevice));
+    }
     ring_set(g_ring_cur + a + 1);
     const int base = n_proc;
     n_proc += a + 1;
+    // DFlash2: the anchor and the accepted drafts (verify rows 0..a) join the drafter context
+    if (dfl) df_ingest(base, a + 1);
     // MTP KV repair: positions base+1..base+a get the trunk's hidden, not the draft's
-    if (a >= 1) {
+    if (!dfl && a >= 1) {
       up(d_mtp_ids, drafts, (size_t)a * 4);
       mtp_rows(d_mtp_hin, d_mtp_ids, a, base + 1, false);
     }
@@ -2835,6 +3384,7 @@ extern "C" int chlorine_trunk_generate3(const int* prompt, int n_prompt, long ma
   }
   *decode_ms = (now_s() - td) * 1000.0;
   *stop_hit = stop;
+  g_df_capture = 0;
   if (spec)
     fprintf(stderr, "spec: rounds %d proposed %d accepted %d (%.3f) committed %d tokens/round %.2f draft %.1f ms verify %.1f ms ingest %.1f ms mtp-prefill %.1f ms\n",
             st->rounds, st->proposed, st->accepted, st->proposed ? (double)st->accepted / st->proposed : 0.0,

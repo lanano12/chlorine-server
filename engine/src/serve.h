@@ -39,18 +39,26 @@ class Server {
                               const std::vector<int>& prompt, const GenOpts& o,
                               int emit_fd);
 
-  explicit Server(const Checkpoint& ckpt, Options opts, GenerateFn gen, void* ctx);
+  // SCORE <req> <n_prompt> <n_ids> <ids...>: teacher-forced NLL/argmax of the
+  // continuation ids[n_prompt..n) through the prefill path (quality gates)
+  using ScoreFn = void (*)(void* ctx, long req_id, int n_prompt, const std::vector<int>& ids, int fd);
+  using CstatFn = int (*)(char* buf, int cap);   // fills the C line (prompt cache counters)
+  explicit Server(const Checkpoint& ckpt, Options opts, GenerateFn gen, void* ctx, ScoreFn score = nullptr,
+                  CstatFn cstat = nullptr);
   void serve();  // blocks forever
 
  private:
   void handle_line(int fd, const std::string& line);
   void handle_gen(int fd, std::istringstream& in);
+  void handle_score(int fd, std::istringstream& in);
   void send_all(int fd, const std::string& s);
 
   const Checkpoint& ckpt_;
   Options opts_;
   GenerateFn gen_;
   void* gen_ctx_;
+  ScoreFn score_ = nullptr;
+  CstatFn cstat_ = nullptr;
   std::string info_line_;
   bool quit_ = false;   // set by the QUIT verb; serve() returns
 };

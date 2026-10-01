@@ -41,13 +41,17 @@ int chlorine_trunk_generate2(const int* prompt, int n_prompt, long max_tokens,
 struct chlorine_spec_stats {
   int drafter, rounds, proposed, accepted, committed;
   double draft_ms, verify_ms, ingest_ms, mtp_prefill_ms;
+  int n_cached;
 };
+int chlorine_trunk_cstat(char* buf, int cap);
 int chlorine_trunk_generate3(const int* prompt, int n_prompt, long max_tokens,
                              const int* eos, int n_eos,
                              void (*emit)(void*, int, float), void* ctx,
                              double* prefill_ms, double* decode_ms, int* stop_hit,
                              const chlorine_sample_opts* opts, int drafter,
                              chlorine_spec_stats* st);
+int chlorine_trunk_score(const int* ids, int n, int n_prompt, float* nll_out, int* pred_out);
+int chlorine_trunk_score_decode(const int* ids, int n, int n_prompt, float* nll_out, int* pred_out);
 int chlorine_trunk_ctx_cap(void);
 int chlorine_trunk_tmax(void);
 void chlorine_trunk_shutdown(void);
@@ -72,6 +76,33 @@ static void trunk_emit(void* ctx, int tok, float logp) {
     if (w <= 0) return;
     off += size_t(w);
   }
+}
+
+void real_score(void* ctx, long id, int n_prompt, const std::vector<int>& ids, int fd) {
+  (void)ctx;
+  std::vector<float> nll(ids.size());
+  std::vector<int> pred(ids.size());
+  static int score_decode = -1;
+  if (score_decode < 0) { const char* e = getenv("HALO_SCORE_DECODE"); score_decode = (e && atoi(e) == 1) ? 1 : 0; }
+  int n = !g_trunk_ready ? -1
+        : score_decode ? chlorine_trunk_score_decode(ids.data(), int(ids.size()), n_prompt, nll.data(), pred.data())
+                       : chlorine_trunk_score(ids.data(), int(ids.size()), n_prompt, nll.data(), pred.data());
+  std::string out;
+  if (n < 0) {
+    out = "S " + std::to_string(id) + " error " + std::to_string(n) + "\n";
+  } else {
+    double sum = 0;
+    for (int i = 0; i < n; i++) sum += nll[size_t(i)];
+    char buf[96];
+    snprintf(buf, sizeof buf, "S %ld %d %.6f\n", id, n, n ? sum / n : 0.0);
+    out = buf;
+    out += "N " + std::to_string(id);
+    for (int i = 0; i < n; i++) { snprintf(buf, sizeof buf, " %.5f", double(nll[size_t(i)])); out += buf; }
+    out += "\nP " + std::to_string(id);
+    for (int i = 0; i < n; i++) { snprintf(buf, sizeof buf, " %d", pred[size_t(i)]); out += buf; }
+    out += "\n";
+  }
+  send(fd, out.data(), out.size(), MSG_NOSIGNAL);
 }
 
 void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& eos,
@@ -114,9 +145,9 @@ void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& e
   }
   char buf[160];
   // drafter / rounds / committed-in-rounds, as WIRE-PROTOCOL.md specifies
-  snprintf(buf, sizeof buf, "D %ld %s %zu %d %.1f %.1f %d %d %d\n", id,
+  snprintf(buf, sizeof buf, "D %ld %s %zu %d %.1f %.1f %d %d %d %d\n", id,
            stop_hit ? "stop" : "length", prompt.size(), n_gen, prefill_ms, decode_ms,
-           st.drafter, st.rounds, st.committed);
+           st.drafter, st.rounds, st.committed, st.n_cached);
   size_t off = 0;
   size_t len = strlen(buf);
   while (off < len) {
@@ -214,7 +245,7 @@ int main(int argc, char** argv) {
     }
     Server svr(ckpt, o, g_trunk_ready && !getenv("CHLORINE_STUB") ? real_generate
                                                                   : stub_generate,
-               nullptr);
+               nullptr, g_trunk_ready ? real_score : nullptr, g_trunk_ready ? chlorine_trunk_cstat : nullptr);
     svr.serve();
   }
   if (g_trunk_ready) chlorine_trunk_shutdown();

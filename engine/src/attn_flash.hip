@@ -52,7 +52,7 @@ __device__ __forceinline__ float flash_shuffle(float x, int off) {
 
 // DS waves share each 16-query group and split the 256 output columns.
 // K and V reuse the same LDS array after scores are consumed.
-template<int F_QT, int F_KT, int DS, bool TRANSPOSE_V = false, bool FAST_EXP = false, bool GLOBAL_Q = false, int LOAD_VECTOR = 1, bool DPP = false, bool PREFETCH = false, bool HEAD_MAJOR = false, bool TRANSPOSED_CACHE = false>
+template<int F_QT, int F_KT, int DS, bool TRANSPOSE_V = false, bool FAST_EXP = false, bool GLOBAL_Q = false, int LOAD_VECTOR = 1, bool DPP = false, bool PREFETCH = false, bool HEAD_MAJOR = false, bool TRANSPOSED_CACHE = false, bool SPLIT_QK = false, bool PREFETCH_K = false, bool REG_Q = false>
 __global__ void __launch_bounds__((F_QT / 16) * DS * 32)
 k_attention_flash_f16(const uint16_t* __restrict__ Q,
                       const uint16_t* __restrict__ K,
@@ -63,19 +63,39 @@ k_attention_flash_f16(const uint16_t* __restrict__ Q,
   static_assert(F_QT % 16 == 0 && F_KT % 16 == 0 && (DS == 1 || DS == 2));
   static_assert(!TRANSPOSED_CACHE || TRANSPOSE_V);
   static_assert(LOAD_VECTOR == 1 || LOAD_VECTOR == 8 || LOAD_VECTOR == 16);
+  // SPLIT_QK: the DS waves of a query group no longer both compute the whole
+  // QK^T tile; wave dgroup computes the key fragments f with f % DS == dgroup
+  // and exponentiates only those. The row maximum and the per-lane
+  // probability pair are exchanged through LDS so that every wave evaluates
+  // exactly the expressions of the unsplit kernel in the same order
+  // (max is exact; es = p_0 + p_1 per lane, then the same XOR tree), which
+  // keeps the outputs bit-identical to the unsplit kernel.
+  // PREFETCH_K: the next chunk's K tile is loaded into registers during the
+  // PV product of the current chunk and stored to LDS at the top of the loop.
+  // REG_Q: each lane keeps its 16 A-fragment slices of Q (16 dk x 16 halves,
+  // 128 VGPRs) for the whole key loop; no Q tile in LDS (QROWS = 1), so two
+  // workgroups fit per CU. Bit-identical: the same f16 values feed the same WMMAs.
+  static_assert(!SPLIT_QK || (DS == 2 && NF == 2 && !GLOBAL_Q));
+  static_assert(!(REG_Q && GLOBAL_Q));
+  static_assert(!PREFETCH_K || (!TRANSPOSED_CACHE || TRANSPOSE_V));
   using load_vec = short __attribute__((ext_vector_type(LOAD_VECTOR)));
   // A 16-byte row alignment lets the compiler use ds_load_b128 for WMMA
   // fragments; a 2-half pad degenerates into individual halfword gathers.
   constexpr int VSTR = F_KT + 8;
-  constexpr int QROWS = GLOBAL_Q ? 1 : F_QT;
+  constexpr int QROWS = (GLOBAL_Q || REG_Q) ? 1 : F_QT;
   constexpr int KVSHORTS = TRANSPOSE_V && F_HD * VSTR > F_KT * F_STR ? F_HD * VSTR : F_KT * F_STR;
   static_assert(2 * (QROWS * F_STR + KVSHORTS + F_QT * F_PSTR) <= 65536);
   __shared__ short qs[QROWS][F_STR];
-  __shared__ union {
+  __shared__ __align__(16) union {
     short key[F_KT][F_STR];
     short value[TRANSPOSE_V ? F_HD : 1][TRANSPOSE_V ? VSTR : 1];
   } kv;
   __shared__ short probs[F_QT][F_PSTR];
+  __shared__ float mxs[SPLIT_QK ? F_QT / 16 : 1][SPLIT_QK ? NF : 1][SPLIT_QK ? 16 : 1];
+  // fp32 probability exchange for SPLIT_QK lives in the K/V tile region, which
+  // is dead between the last K fragment read and the V tile store.
+  static_assert(!SPLIT_QK || (F_QT / 16) * NF * 16 * 16 * (int)sizeof(float) <= KVSHORTS * (int)sizeof(short));
+  float (*xs)[NF][16][16] = reinterpret_cast<float (*)[NF][16][16]>(&kv);
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int qgroup = wave / DS, dgroup = wave % DS;
   const int col = lane & 15, halfrow = lane >> 4;
@@ -84,7 +104,19 @@ k_attention_flash_f16(const uint16_t* __restrict__ Q,
   int arow = -1;
   if (lane < 16 && !(lane & 1)) arow = lane / 2;
   else if (lane >= 17 && (lane & 1)) arow = 8 + (lane - 17) / 2;
-  if constexpr (!GLOBAL_Q) for (int i = tid * LOAD_VECTOR; i < F_QT * F_HD; i += NT * LOAD_VECTOR) {
+  flash_h16 qa[REG_Q ? 16 : 1];
+  if constexpr (REG_Q) {
+    const int query = q0 + qgroup * 16 + arow;
+#pragma unroll
+    for (int dk = 0; dk < 16; dk++) {
+      flash_h16 raw = {0}, x = {0};
+      if (arow >= 0 && query < T) memcpy(&raw, Q + ((long)query * F_QH + h) * F_HD + dk * 16, sizeof(raw));
+#pragma unroll
+      for (int k = 0; k < 16; k++) x[k] = flash_half(flash_bfloat((uint16_t)raw[k]));
+      qa[dk] = x;
+    }
+  }
+  if constexpr (!GLOBAL_Q && !REG_Q) for (int i = tid * LOAD_VECTOR; i < F_QT * F_HD; i += NT * LOAD_VECTOR) {
     int r = i / F_HD, d = i % F_HD;
     load_vec x = {0}, raw = {0};
     if (q0 + r < T) memcpy(&raw, Q + ((long)(q0 + r) * F_QH + h) * F_HD + d, sizeof(raw));
@@ -101,8 +133,32 @@ k_attention_flash_f16(const uint16_t* __restrict__ Q,
   for (int e = 0; e < 8; e++) { mxrun[e] = -INFINITY; sumrun[e] = 0; }
   const int last_query = (q0 + F_QT < T ? q0 + F_QT : T) - 1;
   const int nkeys = pos_base + last_query + 1;
+  constexpr int NLOAD = (F_KT * F_HD + NT * LOAD_VECTOR - 1) / (NT * LOAD_VECTOR);
+  load_vec kr[PREFETCH_K ? NLOAD : 1];
+  auto load_k_regs = [&](int kbase) {
+#pragma unroll
+    for (int u = 0; u < NLOAD; u++) {
+      int i = (tid + u * NT) * LOAD_VECTOR, key = kbase + i / F_HD;
+      kr[u] = {0};
+      if (i < F_KT * F_HD && key < nkeys)
+        memcpy(&kr[u], K + ((long)key * F_KVH + kh) * F_HD + i % F_HD, sizeof(load_vec));
+    }
+  };
+  if constexpr (PREFETCH_K) load_k_regs(0);
   for (int k0 = 0; k0 < nkeys; k0 += F_KT) {
     __syncthreads();
+    if constexpr (PREFETCH_K) {
+#pragma unroll
+      for (int u = 0; u < NLOAD; u++) {
+        int i = (tid + u * NT) * LOAD_VECTOR;
+        if (i >= F_KT * F_HD) continue;
+        int r = i / F_HD, d = i % F_HD;
+        load_vec x;
+#pragma unroll
+        for (int j = 0; j < LOAD_VECTOR; j++) x[j] = flash_half(flash_bfloat((uint16_t)kr[u][j]));
+        memcpy(&kv.key[r][d], &x, sizeof(x));
+      }
+    } else {
     for (int i = tid * LOAD_VECTOR; i < F_KT * F_HD; i += NT * LOAD_VECTOR) {
       int r = i / F_HD, d = i % F_HD, key = k0 + r;
       load_vec x = {0}, raw = {0};
@@ -111,16 +167,23 @@ k_attention_flash_f16(const uint16_t* __restrict__ Q,
       for (int j = 0; j < LOAD_VECTOR; j++) x[j] = flash_half(flash_bfloat((uint16_t)raw[j]));
       memcpy(&kv.key[r][d], &x, sizeof(x));
     }
+    }
     __syncthreads();
-    constexpr int NLOAD = (F_KT * F_HD + NT * LOAD_VECTOR - 1) / (NT * LOAD_VECTOR);
     load_vec vr[NLOAD];
     if constexpr (PREFETCH) {
 #pragma unroll
       for (int u = 0; u < NLOAD; u++) {
-        int i = (tid + u * NT) * LOAD_VECTOR, key = k0 + i / F_HD;
+        int i = (tid + u * NT) * LOAD_VECTOR;
         vr[u] = {0};
-        if (i < F_KT * F_HD && key < nkeys)
-          memcpy(&vr[u], V + ((long)key * F_KVH + kh) * F_HD + i % F_HD, sizeof(load_vec));
+        if constexpr (TRANSPOSED_CACHE) {
+          int r = i % F_KT, d = i / F_KT, key = k0 + r;
+          if (i < F_KT * F_HD && key < vstride)
+            memcpy(&vr[u], V + ((long)kh * F_HD + d) * vstride + key, sizeof(load_vec));
+        } else {
+          int key = k0 + i / F_HD;
+          if (i < F_KT * F_HD && key < nkeys)
+            memcpy(&vr[u], V + ((long)key * F_KVH + kh) * F_HD + i % F_HD, sizeof(load_vec));
+        }
       }
     }
     flash_f8 scores[NF];
@@ -129,7 +192,8 @@ k_attention_flash_f16(const uint16_t* __restrict__ Q,
 #pragma unroll
     for (int dk = 0; dk < 16; dk++) {
       flash_h16 a = {0};
-      if (arow >= 0) {
+      if constexpr (REG_Q) a = qa[dk];
+      else if (arow >= 0) {
         if constexpr (GLOBAL_Q) {
           const int query = q0 + qgroup * 16 + arow;
           flash_h16 raw = {0};
@@ -142,12 +206,64 @@ k_attention_flash_f16(const uint16_t* __restrict__ Q,
       }
 #pragma unroll
       for (int f = 0; f < NF; f++) {
+        if constexpr (SPLIT_QK) { if (f % DS != dgroup) continue; }
         flash_h16 b;
 #pragma unroll
         for (int k = 0; k < 16; k++) b[k] = kv.key[f * 16 + col][dk * 16 + k];
         scores[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, scores[f]);
       }
     }
+    if constexpr (SPLIT_QK) {
+      // Own fragment's masked, scaled scores and their row maximum (the same
+      // 16-lane XOR tree as below, applied to one fragment; max is exact).
+      __syncthreads();                       // every wave is done with kv.key
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        const int query = q0 + qgroup * 16 + halfrow * 8 + e;
+        const int f = dgroup, key = k0 + f * 16 + col;
+        float s = query < T && key <= pos_base + query ? scores[f][e] * 0.0625f : -INFINITY;
+        scores[f][e] = s;
+        float m = s;
+#pragma unroll
+        for (int off = 1; off <= 8; off <<= 1) m = fmaxf(m, flash_shuffle<DPP>(m, off));
+        if (col == 0) mxs[qgroup][f][halfrow * 8 + e] = m;
+      }
+      __syncthreads();
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        const int row = halfrow * 8 + e, f = dgroup;
+        float m = fmaxf(mxs[qgroup][0][row], mxs[qgroup][1][row]);
+        const float mnew = fmaxf(mxrun[e], m);
+        float p = 0.f;
+        if (isfinite(scores[f][e])) {
+          if constexpr (FAST_EXP) p = __builtin_amdgcn_exp2f((scores[f][e] - mnew) * 1.4426950408889634f);
+          else p = expf(scores[f][e] - mnew);
+        }
+        xs[qgroup][f][row][col] = p;
+        probs[qgroup * 16 + row][f * 16 + col] = flash_half(p);
+        scores[f][e] = mnew;                 // carried to the merge below
+      }
+      __syncthreads();
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        const int row = halfrow * 8 + e;
+        const float mnew = scores[dgroup][e];
+        float correction = 0.f;
+        if (isfinite(mnew)) {
+          if constexpr (FAST_EXP) correction = __builtin_amdgcn_exp2f((mxrun[e] - mnew) * 1.4426950408889634f);
+          else correction = expf(mxrun[e] - mnew);
+        }
+        float es = 0.f;
+        es += xs[qgroup][0][row][col];
+        es += xs[qgroup][1][row][col];
+#pragma unroll
+        for (int off = 1; off <= 8; off <<= 1) es += flash_shuffle<DPP>(es, off);
+        sumrun[e] = sumrun[e] * correction + es;
+        mxrun[e] = mnew;
+#pragma unroll
+        for (int d = 0; d < ND; d++) accum[d][e] *= correction;
+      }
+    } else {
 #pragma unroll
     for (int e = 0; e < 8; e++) {
       int query = q0 + qgroup * 16 + halfrow * 8 + e;
@@ -188,6 +304,7 @@ k_attention_flash_f16(const uint16_t* __restrict__ Q,
 #pragma unroll
       for (int d = 0; d < ND; d++) accum[d][e] *= correction;
     }
+    }
     __syncthreads();
     if constexpr (!PREFETCH && !TRANSPOSED_CACHE) {
       for (int i = tid * LOAD_VECTOR; i < F_KT * F_HD; i += NT * LOAD_VECTOR) {
@@ -211,7 +328,8 @@ k_attention_flash_f16(const uint16_t* __restrict__ Q,
       int key = k0 + r;
       load_vec x = {0}, raw = {0};
       if constexpr (TRANSPOSED_CACHE) {
-        if (key < vstride) memcpy(&raw, V + ((long)kh * F_HD + d) * vstride + key, sizeof(raw));
+        if constexpr (PREFETCH) raw = vr[u];
+        else if (key < vstride) memcpy(&raw, V + ((long)kh * F_HD + d) * vstride + key, sizeof(raw));
 #pragma unroll
         for (int j = 0; j < LOAD_VECTOR; j++)
           x[j] = key + j < nkeys ? flash_half(flash_bfloat((uint16_t)raw[j])) : 0;
@@ -229,6 +347,7 @@ k_attention_flash_f16(const uint16_t* __restrict__ Q,
     }
     }
     __syncthreads();
+    if constexpr (PREFETCH_K) load_k_regs(k0 + F_KT);   // in flight during PV
 #pragma unroll
     for (int kk = 0; kk < NF; kk++) {
       flash_h16 a = {0};
@@ -369,14 +488,128 @@ k_attn_decode_combine(const SkPartial* __restrict__ part, uint16_t* __restrict__
   }
   O[(size_t)qh * F_HD + d] = flash_out(acc / L);
 }
+__host__ __device__ __forceinline__ void sk_geometry(int keys, int* nsplit, int* chunk) {
+  int ns = (keys + 255) / 256;
+  if (ns > 32) ns = 32;
+  if (ns < 1) ns = 1;
+  *nsplit = ns;
+  *chunk = (keys + ns - 1) / ns;
+}
+// Verify rows (HALO_VERIFY_MERGE=1): blockIdx.z = row r, keys_r = keys0 + r.
+// Each row uses its own split geometry, so its partials and its combine are
+// exactly those of the single-row launch at that position (bit-identical).
+__global__ void __launch_bounds__(256)
+k_attn_decode_splitk_rows(const uint16_t* __restrict__ Q, const uint16_t* __restrict__ K,
+                          const uint16_t* __restrict__ V, SkPartial* __restrict__ part,
+                          int keys0, int part_stride) {
+  const int r = blockIdx.z, keys = keys0 + r;
+  int nsplit, chunk;
+  sk_geometry(keys, &nsplit, &chunk);
+  const int kh = blockIdx.x, split = blockIdx.y;
+  if (split >= nsplit) return;
+  const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int d0 = lane * 8;
+  const uint16_t* Qr = Q + (size_t)r * F_QH * F_HD;
+  float q[6][8];
+#pragma unroll
+  for (int h = 0; h < 6; h++) {
+    const uint4 qv = *reinterpret_cast<const uint4*>(Qr + (size_t)(kh * 6 + h) * F_HD + d0);
+    const uint32_t w[4] = {qv.x, qv.y, qv.z, qv.w};
+#pragma unroll
+    for (int e = 0; e < 4; e++) { q[h][2 * e] = flash_bfloat((uint16_t)(w[e] & 0xFFFFu)); q[h][2 * e + 1] = flash_bfloat((uint16_t)(w[e] >> 16)); }
+  }
+  float m[6], l[6], o[6][8];
+#pragma unroll
+  for (int h = 0; h < 6; h++) { m[h] = -INFINITY; l[h] = 0.f; for (int e = 0; e < 8; e++) o[h][e] = 0.f; }
+  const int kbeg = split * chunk, kend = min(keys, kbeg + chunk);
+  for (int key = kbeg + wave; key < kend; key += SK_WAVES) {
+    const size_t row = ((size_t)key * F_KVH + kh) * F_HD + d0;
+    const uint4 kv = *reinterpret_cast<const uint4*>(K + row);
+    const uint4 vv = *reinterpret_cast<const uint4*>(V + row);
+    const uint32_t kw[4] = {kv.x, kv.y, kv.z, kv.w}, vw[4] = {vv.x, vv.y, vv.z, vv.w};
+    float kf[8], vf[8];
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+      kf[2 * e] = flash_bfloat((uint16_t)(kw[e] & 0xFFFFu)); kf[2 * e + 1] = flash_bfloat((uint16_t)(kw[e] >> 16));
+      vf[2 * e] = flash_bfloat((uint16_t)(vw[e] & 0xFFFFu)); vf[2 * e + 1] = flash_bfloat((uint16_t)(vw[e] >> 16));
+    }
+    float s[6];
+#pragma unroll
+    for (int h = 0; h < 6; h++) {
+      float acc = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; e++) acc = fmaf(q[h][e], kf[e], acc);
+      s[h] = acc;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+      for (int h = 0; h < 6; h++) s[h] += __shfl_xor(s[h], off);
+    }
+#pragma unroll
+    for (int h = 0; h < 6; h++) {
+      const float sc = s[h] * 0.0625f;
+      const float mn = fmaxf(m[h], sc);
+      const float corr = expf(m[h] - mn);
+      const float p = expf(sc - mn);
+      l[h] = l[h] * corr + p;
+#pragma unroll
+      for (int e = 0; e < 8; e++) o[h][e] = fmaf(p, vf[e], o[h][e] * corr);
+      m[h] = mn;
+    }
+  }
+  SkPartial* P = part + (size_t)r * part_stride + (size_t)(kh * nsplit + split) * SK_WAVES + wave;
+#pragma unroll
+  for (int h = 0; h < 6; h++) {
+    if (lane == 0) { P->m[h] = m[h]; P->l[h] = l[h]; }
+    float4* op = reinterpret_cast<float4*>(P->o[h] + d0);
+    op[0] = make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+    op[1] = make_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
+  }
+}
+__global__ void __launch_bounds__(256)
+k_attn_decode_combine_rows(const SkPartial* __restrict__ part, uint16_t* __restrict__ O, int keys0, int part_stride) {
+  const int r = blockIdx.y;
+  int nsplit, chunk;
+  sk_geometry(keys0 + r, &nsplit, &chunk);
+  const int qh = blockIdx.x, kh = qh / 6, h = qh % 6, d = threadIdx.x;
+  const int np = nsplit * SK_WAVES;
+  const SkPartial* P = part + (size_t)r * part_stride + (size_t)kh * np;
+  float M = -INFINITY;
+  for (int i = 0; i < np; i++) M = fmaxf(M, P[i].m[h]);
+  float L = 0.f, acc = 0.f;
+  for (int i = 0; i < np; i++) {
+    const float w = expf(P[i].m[h] - M);
+    L = fmaf(P[i].l[h], w, L);
+    acc = fmaf(P[i].o[h][d], w, acc);
+  }
+  O[(size_t)r * F_QH * F_HD + (size_t)qh * F_HD + d] = flash_out(acc / L);
+}
+static int attention_decode_splitk_rows(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
+                                        uint16_t* O, int keys0, int T) {
+  static SkPartial* part = nullptr;
+  static int cap = 0;
+  if (T < 1 || T > 8) return -1;
+  const int part_stride = F_KVH * 32 * SK_WAVES;
+  const int need = part_stride * 8;
+  if (!part || cap < need) {
+    if (part) { hipError_t e = hipFree(part); if (e != hipSuccess) return (int)e; }
+    hipError_t e = hipMalloc(&part, (size_t)need * sizeof(SkPartial)); if (e != hipSuccess) return (int)e;
+    cap = need;
+  }
+  int nsmax, chunk;
+  sk_geometry(keys0 + T - 1, &nsmax, &chunk);
+  k_attn_decode_splitk_rows<<<dim3(F_KVH, nsmax, T), 256>>>(Q, K, V, part, keys0, part_stride);
+  hipError_t e = hipGetLastError(); if (e != hipSuccess) return (int)e;
+  k_attn_decode_combine_rows<<<dim3(F_QH, T), F_HD>>>(part, O, keys0, part_stride);
+  return (int)hipGetLastError();
+}
 static int attention_decode_splitk(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
                                    uint16_t* O, int keys) {
   static SkPartial* part = nullptr;
   static int cap = 0;
-  int nsplit = (keys + 255) / 256;
-  if (nsplit > 32) nsplit = 32;
-  if (nsplit < 1) nsplit = 1;
-  const int chunk = (keys + nsplit - 1) / nsplit;
+  int nsplit, chunk;
+  sk_geometry(keys, &nsplit, &chunk);
   const int need = F_KVH * 32 * SK_WAVES;
   if (!part || cap < need) {
     if (part) { hipError_t e = hipFree(part); if (e != hipSuccess) return (int)e; }
@@ -404,7 +637,7 @@ static int attention_flash_impl(const uint16_t* Q, const uint16_t* K,
   // Keep single-token attention on the phase-2E path: transposing the whole
   // KV prefix on every decode step would add work unrelated to prefill.
   const int opt = T > 1 && cfg ? atoi(cfg) : 0;
-  if (opt == 2) {
+  if (opt >= 2) {
     static uint16_t* vt = nullptr;
     static size_t capacity = 0;
     const int keys = pos_base + T, stride = (keys + 15) & ~15;
@@ -416,8 +649,31 @@ static int attention_flash_impl(const uint16_t* Q, const uint16_t* K,
     }
     k_flash_transpose_v<<<dim3((stride+31)/32,F_HD/32,F_KVH),256>>>(V, vt, keys, stride);
     hipError_t e = hipGetLastError(); if (e != hipSuccess) return (int)e;
-    k_attention_flash_f16<64,32,2,true,false,false,16,true,false,true,true>
-        <<<dim3(F_QH,(T+63)/64),256>>>(Q,K,vt,O,T,pos_base,stride);
+    // 3: register prefetch of the next K and V tiles during the current
+    //    tile's products (bit-identical to 2; isolated 4K/8K: -6..7%).
+    // 4: 3 + v_exp_f32 for the softmax exponentials (not bit-identical; a
+    //    declared numerics change guarded by the same tolerance and token checks).
+    // 5: 2 + SPLIT_QK (bit-identical; measured 2.5x slower: one dependent WMMA
+    //    chain per wave loses the two-chain interleave). Kept for the record.
+    if (opt == 3)
+      k_attention_flash_f16<64,32,2,true,false,false,16,true,true,true,true,false,true>
+          <<<dim3(F_QH,(T+63)/64),256>>>(Q,K,vt,O,T,pos_base,stride);
+    else if (opt == 4)
+      k_attention_flash_f16<64,32,2,true,true,false,16,true,true,true,true,false,true>
+          <<<dim3(F_QH,(T+63)/64),256>>>(Q,K,vt,O,T,pos_base,stride);
+    else if (opt == 5)
+      k_attention_flash_f16<64,32,2,true,false,false,16,true,false,true,true,true,false>
+          <<<dim3(F_QH,(T+63)/64),256>>>(Q,K,vt,O,T,pos_base,stride);
+    // 6: 3 + Q resident in registers (no Q tile in LDS; two workgroups per CU); 7: 6 + fast exp
+    else if (opt == 6)
+      k_attention_flash_f16<64,32,2,true,false,false,16,true,true,true,true,false,true,true>
+          <<<dim3(F_QH,(T+63)/64),256>>>(Q,K,vt,O,T,pos_base,stride);
+    else if (opt == 7)
+      k_attention_flash_f16<64,32,2,true,true,false,16,true,true,true,true,false,true,true>
+          <<<dim3(F_QH,(T+63)/64),256>>>(Q,K,vt,O,T,pos_base,stride);
+    else
+      k_attention_flash_f16<64,32,2,true,false,false,16,true,false,true,true>
+          <<<dim3(F_QH,(T+63)/64),256>>>(Q,K,vt,O,T,pos_base,stride);
   } else if (opt == 1) {
     k_attention_flash_f16<64,32,2,false,false,false,16,true,false,true>
         <<<dim3(F_QH,(T+63)/64),256>>>(Q,K,V,O,T,pos_base);
@@ -445,4 +701,9 @@ extern "C" int chlorine_attention_decode_splitk(const uint16_t* Q, const uint16_
   int rc = attention_decode_splitk(Q, K, V, O, pos_base + 1);
   if (rc == 0) rc = (int)hipDeviceSynchronize();
   return rc;
+}
+
+extern "C" int chlorine_attention_decode_splitk_rows(const uint16_t* Q, const uint16_t* K, const uint16_t* V,
+                                                     uint16_t* O, int pos_base, int T) {
+  return attention_decode_splitk_rows(Q, K, V, O, pos_base + 1, T);
 }

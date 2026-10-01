@@ -35,8 +35,8 @@ std::string fmt_d_error(long id) {
 
 }  // namespace
 
-Server::Server(const Checkpoint& ckpt, Options opts, GenerateFn gen, void* ctx)
-    : ckpt_(ckpt), opts_(opts), gen_(gen), gen_ctx_(ctx) {
+Server::Server(const Checkpoint& ckpt, Options opts, GenerateFn gen, void* ctx, ScoreFn score, CstatFn cstat)
+    : ckpt_(ckpt), opts_(opts), gen_(gen), gen_ctx_(ctx), score_(score), cstat_(cstat) {
   // INFO line — same field order as the original (see WIRE-PROTOCOL.md):
   // I mtp draft_head ctx spec_rows default drafter_weights dflash2
   //   cache_mb cache_align kv_slots slot_ctx
@@ -129,6 +129,21 @@ void Server::handle_gen(int fd, std::istringstream& in) {
   gen_(gen_ctx_, id, int(max_tokens), eos, prompt, o, fd);
 }
 
+void Server::handle_score(int fd, std::istringstream& in) {
+  long id = -1;
+  int n_prompt = 0;
+  long n_ids = 0;
+  if (!(in >> id >> n_prompt >> n_ids) || n_ids < 2 || n_ids >= 0x40000 || n_prompt < 1 || n_prompt >= n_ids) {
+    send_all(fd, "S " + std::to_string(id) + " error\n");
+    return;
+  }
+  std::vector<int> ids(static_cast<size_t>(n_ids));
+  for (long i = 0; i < n_ids; i++)
+    if (!(in >> ids[size_t(i)])) { send_all(fd, "S " + std::to_string(id) + " error\n"); return; }
+  if (!score_) { send_all(fd, "S " + std::to_string(id) + " error\n"); return; }
+  score_(gen_ctx_, id, n_prompt, ids, fd);
+}
+
 void Server::handle_line(int fd, const std::string& line) {
   std::istringstream in(line);
   std::string verb;
@@ -138,15 +153,18 @@ void Server::handle_line(int fd, const std::string& line) {
   } else if (verb == "INFO") {
     send_all(fd, info_line_ + "\n");
   } else if (verb == "CSTAT") {
-    // cache disabled in the skeleton: entries, bytes, reserved, cap, hits,
-    // misses, stores, evicted, tokens_saved, store_ms, restore_ms,
-    // last_store_ms, last_restore_ms, refused
-    send_all(fd, "C 0 0 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0 0\n");
+    // entries, bytes, reserved, cap, hits, misses, stores, evicted,
+    // tokens_saved, store_ms, restore_ms, last_store_ms, last_restore_ms, refused
+    char buf[256];
+    if (cstat_ && cstat_(buf, sizeof buf) > 0) send_all(fd, std::string(buf) + "\n");
+    else send_all(fd, "C 0 0 0 0 0 0 0 0 0 0.0 0.0 0.0 0.0 0\n");
   } else if (verb == "GEN") {
     handle_gen(fd, in);
   } else if (verb.size() == 1 && verb[0] == 'X') {
     long id;
     in >> id;  // skeleton has no in-flight registry; ignore
+  } else if (verb == "SCORE") {
+    handle_score(fd, in);
   } else if (verb == "QUIT") {
     // graceful stop (profiler flush, harness teardown): reply, then leave serve()
     send_all(fd, "BYE\n");

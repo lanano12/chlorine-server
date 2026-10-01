@@ -5834,6 +5834,103 @@ k_gdn_step1(const uint16_t* __restrict__ qkv, const float* __restrict__ gateG,
   }
 }
 
+// T sequential single-token steps in one launch (speculative verify with
+// HALO_VERIFY_MERGE=1). Thread j keeps column j of the head's 128x128 state in
+// registers across rows: row r starts from the values row r-1 wrote to slot
+// p[r] (the same fp32 values, so every expression below is k_gdn_step1's for
+// that row) and writes slot p[r+1]. Row 0 reads slot p[0] from memory.
+struct GdnSlots { float* p[9]; };
+__global__ void __launch_bounds__(128)
+k_gdn_step_rows(const uint16_t* __restrict__ qkv, const float* __restrict__ gateG,
+                const float* __restrict__ gateB, GdnSlots slots, int T,
+                uint16_t* __restrict__ out, int dnprep, float qscale) {
+  const int hh = (int)blockIdx.x;
+  const int j = (int)threadIdx.x;
+  __shared__ float sq[GDN_DK], sk[GDN_DK];
+  __shared__ float Qs[GDN_DK], Ks[GDN_DK], Vs[GDN_DV];
+  __shared__ float sc[4];
+  float col[GDN_DK];
+  {
+    const float* Sh = slots.p[0] + ((long)hh * GDN_DK) * GDN_DV;
+#pragma unroll
+    for (int i = 0; i < GDN_DK; i++) col[i] = Sh[(long)i * GDN_DV + j];
+  }
+  for (int r = 0; r < T; r++) {
+    const uint16_t* rowq = qkv + (long)r * GDN_QKVW;
+    const uint16_t* qp = rowq + (hh / 3) * GDN_DK;
+    const uint16_t* kp = rowq + GDN_HK * GDN_DK + (hh / 3) * GDN_DK;
+    const uint16_t* vp = rowq + GDN_HK * GDN_DK * 2 + hh * GDN_DV;
+    __syncthreads();                       // previous row's readers of Qs/Ks/Vs/sc are done
+    {
+      float a = gdn_bf16f(qp[j]);
+      float b = gdn_bf16f(kp[j]);
+      sq[j] = a * a;
+      sk[j] = b * b;
+    }
+    __syncthreads();
+    if (j == 0) {
+      float qs = 0.f, ks = 0.f;
+      for (int i = 0; i < GDN_DK; i++) {
+        qs += sq[i];
+        ks += sk[i];
+      }
+      sc[0] = 1.0f / sqrtf(qs + GDN_EPS) * qscale;
+      sc[1] = 1.0f / sqrtf(ks + GDN_EPS);
+    }
+    __syncthreads();
+    {
+      float qv = gdn_bf16f(qp[j]) * sc[0];
+      float kv = gdn_bf16f(kp[j]) * sc[1];
+      if (dnprep) {
+        qv = gdn_bf16f(gdn_f32bf_host(qv));
+        kv = gdn_bf16f(gdn_f32bf_host(kv));
+      }
+      Qs[j] = qv;
+      Ks[j] = kv;
+      Vs[j] = gdn_bf16f(vp[j]);
+    }
+    __syncthreads();
+    float cum0 = 0.f;
+    cum0 += gateG[(long)r * GDN_HV + hh];
+    const float B = gateB[(long)r * GDN_HV + hh];
+    const float ec = gdn_expf(cum0);
+    const float ecd = gdn_expf(cum0 - cum0);
+    const float decay = gdn_expf(cum0);
+    const float decay00 = gdn_expf(cum0 - cum0);
+    float qkd = 0.f;
+    if (decay00 != 0.f) {
+      for (int i = 0; i < GDN_DK; i++) {
+        float kv = Ks[i];
+        qkd += Qs[i] * kv;
+      }
+    }
+    const float W = qkd * decay00;
+    const float nv = Vs[j] * B;
+    float s1 = 0.f, s2v = 0.f;
+#pragma unroll
+    for (int i = 0; i < GDN_DK; i++) {
+      float Si = col[i];
+      float krow = (Ks[i] * B) * ec;
+      float qrow = Qs[i] * ec;
+      s1 += krow * Si;
+      s2v += qrow * Si;
+    }
+    const float vn = nv - s1;
+    float inter = s2v;
+    if (W != 0.f) inter += W * vn;
+    out[(long)r * (GDN_HV * GDN_DV) + hh * GDN_DV + j] = gdn_f32bf_host(inter);
+    float* So = slots.p[r + 1] + ((long)hh * GDN_DK) * GDN_DV;
+#pragma unroll
+    for (int i = 0; i < GDN_DK; i++) {
+      float s = col[i] * decay;
+      float kk = Ks[i] * ecd;
+      s += kk * vn;
+      col[i] = s;
+      So[(long)i * GDN_DV + j] = s;
+    }
+  }
+}
+
 static int g_tpad = 0;
 static float *g_Q, *g_K, *g_V, *g_nv, *g_kcd, *g_qd, *g_kd, *g_vn, *g_s2, *g_ut, *g_intra, *g_exps;
 
@@ -5950,6 +6047,15 @@ extern "C" int chlorine_gdn_step_io(const uint16_t* qkv, const float* G, const f
                                     int dnprep, float qscale, int sync) {
   k_gdn_step1<<<GDN_HV, 128>>>(qkv, G, B, Sin, Sout, out, dnprep, qscale);
   if (gdn_ck(hipGetLastError(), "step_io")) return -2;
+  if (sync && gdn_ck(hipDeviceSynchronize(), "sync")) return -2;
+  return 0;
+}
+
+extern "C" int chlorine_gdn_step_rows(const uint16_t* qkv, const float* G, const float* B,
+                                      GdnSlots slots, int T, uint16_t* out, int dnprep, float qscale, int sync) {
+  if (T < 1 || T > 8) return -3;
+  k_gdn_step_rows<<<GDN_HV, 128>>>(qkv, G, B, slots, T, out, dnprep, qscale);
+  if (gdn_ck(hipGetLastError(), "step_rows")) return -2;
   if (sync && gdn_ck(hipDeviceSynchronize(), "sync")) return -2;
   return 0;
 }

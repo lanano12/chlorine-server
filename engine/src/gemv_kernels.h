@@ -144,6 +144,66 @@ __global__ void k_gemv_dq_vec(const uint16_t* __restrict__ A,
   if (tid == 0) C[n] = f32bf(sh[0]);
 }
 
+// ---- W4 decode (HALO_W4DEC): GEMV over a resident .i4l plane ----
+// A is the Hadamard-rotated bf16 activation (k_had_rows: the same H/16 rotation
+// k_actq_emit applies before quantizing for the W4A4 prefill, but the rotated
+// activation stays bf16 here, so this is W4A16). Weight k of row n is
+// code * fp16f(Ws[n][k/256]) exactly (small integer times an f16 value is exact
+// in f32). Strips, even/odd accumulators and the reduction tree are those of
+// k_gemv_dq_vec, so the multi-row variant (Q4C == 2 below) is bit-identical
+// per row to this kernel. Not bf16-exact against the fp8r/q4c decode path: a
+// declared quality configuration like W4A4-all-400.
+// Same function as fp16f in generator.hip / gi4::fp16f (exact bit conversion).
+__device__ __forceinline__ float gemv_fp16f(uint16_t h) {
+  uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t man = h & 0x3FFu;
+  if (exp == 0) { float d = (float)man * (1.0f / 16777216.0f); return sign ? -d : d; }
+  if (exp == 31) return man ? nanf("1") : (sign ? -INFINITY : INFINITY);
+  uint32_t u = sign | ((exp - 15 + 127) << 23) | (man << 13);
+  return __uint_as_float(u);
+}
+__device__ __forceinline__ float gemv_i4_code(uint32_t nib) {
+  return (float)((int)nib - (int)((nib & 8u) << 1));     // two's complement nibble
+}
+template<int NT = 0>
+__global__ void k_gemv_i4l_vec(const uint16_t* __restrict__ A,
+                               const uint8_t* __restrict__ Wc,
+                               const uint16_t* __restrict__ Ws,
+                               uint16_t* __restrict__ C, int K) {
+  int n = blockIdx.x;
+  const uint8_t* row = Wc + (size_t)n * (K >> 1);
+  const uint16_t* srow = Ws + (size_t)n * (K >> 8);
+  int tid = threadIdx.x;
+  float acc0 = 0.f, acc1 = 0.f;
+  for (int k0 = tid * 16; k0 < K; k0 += 4096) {
+    const uint4 av0 = *reinterpret_cast<const uint4*>(A + k0);
+    const uint4 av1 = *reinterpret_cast<const uint4*>(A + k0 + 8);
+    const uint32_t av[8] = {av0.x, av0.y, av0.z, av0.w, av1.x, av1.y, av1.z, av1.w};
+    uint32_t cv[2];
+    if (NT) { const gemv_u32x2 cw = __builtin_nontemporal_load(reinterpret_cast<const gemv_u32x2*>(row + (k0 >> 1))); cv[0] = cw.x; cv[1] = cw.y; }
+    else { const uint2 cw = *reinterpret_cast<const uint2*>(row + (k0 >> 1)); cv[0] = cw.x; cv[1] = cw.y; }
+    const float sc = gemv_fp16f(srow[k0 >> 8]);
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      const uint32_t byte = (cv[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
+      const float w0 = gemv_i4_code(byte & 0xF) * sc;          // even k: low nibble
+      const float w1 = gemv_i4_code((byte >> 4) & 0xF) * sc;   // odd k: high nibble
+      acc0 = fmaf(bf16f((uint16_t)(av[j] & 0xFFFFu)), w0, acc0);
+      acc1 = fmaf(bf16f((uint16_t)(av[j] >> 16)), w1, acc1);
+    }
+  }
+  float acc = acc0 + acc1;
+  __shared__ float sh[256];
+  sh[tid] = acc;
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (tid < off) sh[tid] += sh[tid + off];
+    __syncthreads();
+  }
+  if (tid == 0) C[n] = f32bf(sh[0]);
+}
+
 // bf16 GEMV with f32 output, 16-byte loads; bit-identical to k_gemv_bf16f.
 __global__ void k_gemv_bf16f_vec(const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
                                  float* __restrict__ C, int K) {
@@ -246,13 +306,56 @@ __global__ void k_gemv_bf16_bf16out_vec(const uint16_t* __restrict__ A, const ui
   if (tid == 0) C[n] = f32bf(sh[0]);
 }
 
+// P activation rows through one pass over a bf16 weight matrix; row p is
+// bit-identical to k_gemv_bf16_bf16out_vec on that row (same strips, even/odd
+// accumulators and tree). A rows are K apart, C rows are N apart.
+template<int P>
+__global__ void k_gemv_bf16_bf16out_rows(const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+                                         uint16_t* __restrict__ C, int K, int N) {
+  int n = blockIdx.x;
+  const uint16_t* row = W + (size_t)n * K;
+  int tid = threadIdx.x;
+  float acc0[P], acc1[P];
+#pragma unroll
+  for (int p = 0; p < P; p++) { acc0[p] = 0.f; acc1[p] = 0.f; }
+  for (int k0 = tid * 16; k0 < K; k0 += 4096) {
+    const uint4 wv0 = *reinterpret_cast<const uint4*>(row + k0);
+    const uint4 wv1 = *reinterpret_cast<const uint4*>(row + k0 + 8);
+    const uint32_t wv[8] = {wv0.x, wv0.y, wv0.z, wv0.w, wv1.x, wv1.y, wv1.z, wv1.w};
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+      const uint16_t* Ap = A + (size_t)p * K;
+      const uint4 av0 = *reinterpret_cast<const uint4*>(Ap + k0);
+      const uint4 av1 = *reinterpret_cast<const uint4*>(Ap + k0 + 8);
+      const uint32_t av[8] = {av0.x, av0.y, av0.z, av0.w, av1.x, av1.y, av1.z, av1.w};
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        acc0[p] = fmaf(bf16f((uint16_t)(av[j] & 0xFFFFu)), bf16f((uint16_t)(wv[j] & 0xFFFFu)), acc0[p]);
+        acc1[p] = fmaf(bf16f((uint16_t)(av[j] >> 16)), bf16f((uint16_t)(wv[j] >> 16)), acc1[p]);
+      }
+    }
+  }
+  __shared__ float sh[P][256];
+#pragma unroll
+  for (int p = 0; p < P; p++) sh[p][tid] = acc0[p] + acc1[p];
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (tid < off) {
+#pragma unroll
+      for (int p = 0; p < P; p++) sh[p][tid] += sh[p][tid + off];
+    }
+    __syncthreads();
+  }
+  if (tid < P) C[(size_t)tid * N + n] = f32bf(sh[tid][0]);
+}
+
 // ---- multi-row (speculative verify) variants ----
 // P activation rows share one pass over the weights. For every row the thread
 // mapping, the per-element weight value, the even/odd accumulators and the
 // reduction tree are exactly those of the P = 1 kernel above, so row r's output
 // is bit-identical to a separate single-row call. Rows are P consecutive
 // activation vectors of length K (stride K) and P output vectors (stride N).
-template<int Q4C, int P, int NT = 0, int R = 4>
+template<int Q4C, int P, int NT = 0, int R = 4, bool OUTF32 = false>
 __global__ void __launch_bounds__(256) k_gemv_dq_vec_mr(const uint16_t* __restrict__ A,
                                  const uint8_t* __restrict__ Wp,
                                  const uint16_t* __restrict__ Ws,
@@ -261,10 +364,16 @@ __global__ void __launch_bounds__(256) k_gemv_dq_vec_mr(const uint16_t* __restri
   // R output rows per block: activations are loaded once per strip and reused
   // for R weight rows. Output row n still uses thread tid's strips
   // (tid*16 + 4096*i), its own even/odd accumulators and its own tree.
+  // Q4C: 0 = fp8r plane (Ws = bf16 row scales), 1 = q4c plane (CB codebook,
+  // fp8 group scales in the row), 2 = i4l plane (Ws = f16 scales [N][K/256],
+  // rowstride = K/2; per row bit-identical to k_gemv_i4l_vec), 3 = q4c
+  // variant 1 (NF4 codebook, f16 scale per 32 codes in the row, rowstride
+  // K/2 + K/16; per row bit-identical to k_gemv_q4c1_vec). OUTF32 writes
+  // f32 outputs (C reinterpreted as float*).
   const int n0 = blockIdx.x * R;
   int tid = threadIdx.x;
   __shared__ float cbs[16];
-  if (Q4C) {
+  if (Q4C == 1 || Q4C == 3) {
     if (tid < 16) cbs[tid] = CB[tid];
     __syncthreads();
   }
@@ -287,7 +396,7 @@ __global__ void __launch_bounds__(256) k_gemv_dq_vec_mr(const uint16_t* __restri
     for (int r = 0; r < R; r++) {
       const uint8_t* row = Wp + (size_t)(n0 + r) * rowstride;
       float w0v[8], w1v[8];
-      if (Q4C) {
+      if constexpr (Q4C == 1) {
         uint32_t cv[2];
         if (NT) { const gemv_u32x2 cw = __builtin_nontemporal_load(reinterpret_cast<const gemv_u32x2*>(row + (k0 >> 1))); cv[0] = cw.x; cv[1] = cw.y; }
         else { const uint2 cw = *reinterpret_cast<const uint2*>(row + (k0 >> 1)); cv[0] = cw.x; cv[1] = cw.y; }
@@ -297,6 +406,28 @@ __global__ void __launch_bounds__(256) k_gemv_dq_vec_mr(const uint16_t* __restri
           const uint32_t byte = (cv[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
           w0v[j] = cbs[byte & 0xF] * gs;
           w1v[j] = cbs[(byte >> 4) & 0xF] * gs;
+        }
+      } else if constexpr (Q4C == 3) {
+        uint32_t cv[2];
+        if (NT) { const gemv_u32x2 cw = __builtin_nontemporal_load(reinterpret_cast<const gemv_u32x2*>(row + (k0 >> 1))); cv[0] = cw.x; cv[1] = cw.y; }
+        else { const uint2 cw = *reinterpret_cast<const uint2*>(row + (k0 >> 1)); cv[0] = cw.x; cv[1] = cw.y; }
+        const float gs = __half2float(__ushort_as_half(reinterpret_cast<const uint16_t*>(row + (K >> 1))[k0 >> 5]));
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const uint32_t byte = (cv[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
+          w0v[j] = cbs[byte & 0xF] * gs;
+          w1v[j] = cbs[(byte >> 4) & 0xF] * gs;
+        }
+      } else if constexpr (Q4C == 2) {
+        uint32_t cv[2];
+        if (NT) { const gemv_u32x2 cw = __builtin_nontemporal_load(reinterpret_cast<const gemv_u32x2*>(row + (k0 >> 1))); cv[0] = cw.x; cv[1] = cw.y; }
+        else { const uint2 cw = *reinterpret_cast<const uint2*>(row + (k0 >> 1)); cv[0] = cw.x; cv[1] = cw.y; }
+        const float sc = gemv_fp16f(Ws[(size_t)(n0 + r) * (K >> 8) + (k0 >> 8)]);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const uint32_t byte = (cv[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
+          w0v[j] = gemv_i4_code(byte & 0xF) * sc;
+          w1v[j] = gemv_i4_code((byte >> 4) & 0xF) * sc;
         }
       } else {
         uint32_t cv[4];
@@ -325,7 +456,7 @@ __global__ void __launch_bounds__(256) k_gemv_dq_vec_mr(const uint16_t* __restri
 #pragma unroll
     for (int p = 0; p < P; p++) {
       float acc = acc0[r][p] + acc1[r][p];
-      if (!Q4C) acc *= bf16f(Ws[n0 + r]);
+      if constexpr (Q4C == 0) acc *= bf16f(Ws[n0 + r]);
       sh[r * P + p][tid] = acc;
     }
   __syncthreads();
@@ -338,7 +469,8 @@ __global__ void __launch_bounds__(256) k_gemv_dq_vec_mr(const uint16_t* __restri
   }
   if (tid < R * P) {
     const int r = tid / P, p = tid % P;
-    C[(size_t)p * N + n0 + r] = f32bf(sh[tid][0]);
+    if constexpr (OUTF32) reinterpret_cast<float*>(C)[(size_t)p * N + n0 + r] = sh[tid][0];
+    else C[(size_t)p * N + n0 + r] = f32bf(sh[tid][0]);
   }
 }
 
