@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/ggml-org/llama.cpp",
+  "local_source_repository": "https://github.com/unixsysdev/llama-turboquant",
+  "local_source_revision": "03fa8abc4708dfc13858de0a74695075702c8e26",
+  "source_files": {
+    "ggml/src/ggml-common.h": "9cb781b415d9828f553c7345eef400eca10deaeb3c50f66cb9eaf0394cc2010a",
+    "ggml/src/ggml-quants.c": "9c8cde02e69717e716a0908e1b4345b93867c12787c80dd101b98fbfc0cb81ec"
+  },
+  "license": "MIT"
+}

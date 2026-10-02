@@ -1,0 +1,87 @@
+#pragma once
+#include "upstream/src/gguf.h"
+namespace chlorine_flash {
+inline void validate_model(const gguf::File& f) {
+  if(f.arch()!="qwen4exp") throw std::runtime_error("flash: expected qwen4exp architecture");
+  auto shape=[&](const std::string& name,std::initializer_list<uint64_t> dims) {
+    const auto& t=f.at(name); if(t.nd!=dims.size()) throw std::runtime_error("flash: rank mismatch "+name);
+    size_t j=0; for(auto d:dims) if(t.ne[j++]!=d) throw std::runtime_error("flash: shape mismatch "+name);
+  };
+  if(f.kv_i("qwen4exp.block_count",-1)!=48) throw std::runtime_error("flash: architecture mismatch qwen4exp.block_count");
+  if(f.kv_i("qwen4exp.context_length",-1)!=262144) throw std::runtime_error("flash: architecture mismatch qwen4exp.context_length");
+  if(f.kv_i("qwen4exp.embedding_length",-1)!=2560) throw std::runtime_error("flash: architecture mismatch qwen4exp.embedding_length");
+  if(f.kv_i("qwen4exp.attention.head_count",-1)!=24) throw std::runtime_error("flash: architecture mismatch qwen4exp.attention.head_count");
+  if(f.kv_i("qwen4exp.attention.head_count_kv",-1)!=2) throw std::runtime_error("flash: architecture mismatch qwen4exp.attention.head_count_kv");
+  if(f.kv_i("qwen4exp.expert_count",-1)!=512) throw std::runtime_error("flash: architecture mismatch qwen4exp.expert_count");
+  if(f.kv_i("qwen4exp.expert_used_count",-1)!=10) throw std::runtime_error("flash: architecture mismatch qwen4exp.expert_used_count");
+  if(f.kv_i("qwen4exp.attention.key_length",-1)!=256) throw std::runtime_error("flash: architecture mismatch qwen4exp.attention.key_length");
+  if(f.kv_i("qwen4exp.attention.value_length",-1)!=256) throw std::runtime_error("flash: architecture mismatch qwen4exp.attention.value_length");
+  if(f.kv_i("qwen4exp.expert_feed_forward_length",-1)!=640) throw std::runtime_error("flash: architecture mismatch qwen4exp.expert_feed_forward_length");
+  if(f.kv_i("qwen4exp.expert_shared_feed_forward_length",-1)!=640) throw std::runtime_error("flash: architecture mismatch qwen4exp.expert_shared_feed_forward_length");
+  if(f.kv_i("qwen4exp.ssm.conv_kernel",-1)!=4) throw std::runtime_error("flash: architecture mismatch qwen4exp.ssm.conv_kernel");
+  if(f.kv_i("qwen4exp.ssm.state_size",-1)!=128) throw std::runtime_error("flash: architecture mismatch qwen4exp.ssm.state_size");
+  if(f.kv_i("qwen4exp.ssm.group_count",-1)!=16) throw std::runtime_error("flash: architecture mismatch qwen4exp.ssm.group_count");
+  if(f.kv_i("qwen4exp.ssm.time_step_rank",-1)!=48) throw std::runtime_error("flash: architecture mismatch qwen4exp.ssm.time_step_rank");
+  if(f.kv_i("qwen4exp.ssm.inner_size",-1)!=6144) throw std::runtime_error("flash: architecture mismatch qwen4exp.ssm.inner_size");
+  if(f.kv_i("qwen4exp.full_attention_interval",-1)!=4) throw std::runtime_error("flash: architecture mismatch qwen4exp.full_attention_interval");
+  if(f.kv_i("qwen4exp.rope.dimension_count",-1)!=64) throw std::runtime_error("flash: architecture mismatch qwen4exp.rope.dimension_count");
+  if(f.kv_i("qwen4exp.hyper_connection.count",-1)!=4) throw std::runtime_error("flash: architecture mismatch qwen4exp.hyper_connection.count");
+  if(f.kv_i("qwen4exp.hyper_connection.low_rank",-1)!=320) throw std::runtime_error("flash: architecture mismatch qwen4exp.hyper_connection.low_rank");
+  if(f.kv_i("qwen4exp.attention.indexer.head_count",-1)!=4) throw std::runtime_error("flash: architecture mismatch qwen4exp.attention.indexer.head_count");
+  if(f.kv_i("qwen4exp.attention.indexer.key_length",-1)!=128) throw std::runtime_error("flash: architecture mismatch qwen4exp.attention.indexer.key_length");
+  if(f.kv_i("qwen4exp.attention.indexer.top_k",-1)!=2048) throw std::runtime_error("flash: architecture mismatch qwen4exp.attention.indexer.top_k");
+  if(f.kv_i("qwen4exp.ple.ngram_size",-1)!=3) throw std::runtime_error("flash: architecture mismatch qwen4exp.ple.ngram_size");
+  if(f.kv_i("qwen4exp.ple.heads_per_ngram",-1)!=8) throw std::runtime_error("flash: architecture mismatch qwen4exp.ple.heads_per_ngram");
+  if(f.kv_i("qwen4exp.ple.conv_kernel",-1)!=4) throw std::runtime_error("flash: architecture mismatch qwen4exp.ple.conv_kernel");
+  if(f.kv_i("qwen4exp.ple.eos_token_id",-1)!=248044) throw std::runtime_error("flash: architecture mismatch qwen4exp.ple.eos_token_id");
+  if(f.kv_i("qwen4exp.embedding_length_per_layer_input",-1)!=160) throw std::runtime_error("flash: architecture mismatch qwen4exp.embedding_length_per_layer_input");
+  if(f.kv_i("qwen4exp.ple.image_token_id",-1)!=248056) throw std::runtime_error("flash: architecture mismatch qwen4exp.ple.image_token_id");
+  for(int l : {0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30,32,33,34,36,37,38,40,41,42,44,45,46}) shape("blk."+std::to_string(l)+".attn_gate.weight", {2560,6144});
+  for(int l : {3,7,11,15,19,23,27,31,35,39,43,47}) shape("blk."+std::to_string(l)+".attn_k.weight", {2560,512});
+  for(int l : {3,7,11,15,19,23,27,31,35,39,43,47}) shape("blk."+std::to_string(l)+".attn_k_norm.weight", {256});
+  for(int l : {3,7,11,15,19,23,27,31,35,39,43,47}) shape("blk."+std::to_string(l)+".attn_output.weight", {6144,2560});
+  for(int l : {3,7,11,15,19,23,27,31,35,39,43,47}) shape("blk."+std::to_string(l)+".attn_q.weight", {2560,12288});
+  for(int l : {3,7,11,15,19,23,27,31,35,39,43,47}) shape("blk."+std::to_string(l)+".attn_q_norm.weight", {256});
+  for(int l : {0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30,32,33,34,36,37,38,40,41,42,44,45,46}) shape("blk."+std::to_string(l)+".attn_qkv.weight", {2560,10240});
+  for(int l : {3,7,11,15,19,23,27,31,35,39,43,47}) shape("blk."+std::to_string(l)+".attn_v.weight", {2560,512});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".ffn_down_exps.weight", {640,2560,512});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".ffn_down_shexp.weight", {640,2560});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".ffn_gate_exps.weight", {2560,640,512});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".ffn_gate_inp.weight", {2560,512});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".ffn_gate_inp_shexp.weight", {2560});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".ffn_gate_shexp.weight", {2560,640});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".ffn_up_exps.weight", {2560,640,512});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".ffn_up_shexp.weight", {2560,640});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".hc_attn_down.weight", {10240,320});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".hc_attn_inject.weight", {10240,4});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".hc_attn_norm.weight", {10240});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".hc_attn_up.weight", {320,10240});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".hc_ffn_down.weight", {10240,320});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".hc_ffn_inject.weight", {10240,4});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".hc_ffn_norm.weight", {10240});
+  for(int l : {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47}) shape("blk."+std::to_string(l)+".hc_ffn_up.weight", {320,10240});
+  for(int l : {3,7,11,15,19,23,27,31,35,39,43,47}) shape("blk."+std::to_string(l)+".indexer.k_norm.weight", {128});
+  for(int l : {3,7,11,15,19,23,27,31,35,39,43,47}) shape("blk."+std::to_string(l)+".indexer.k_proj.weight", {2560,128});
+  for(int l : {3,7,11,15,19,23,27,31,35,39,43,47}) shape("blk."+std::to_string(l)+".indexer.q_norm.weight", {128});
+  for(int l : {3,7,11,15,19,23,27,31,35,39,43,47}) shape("blk."+std::to_string(l)+".indexer.q_proj.weight", {2560,512});
+  for(int l : {1}) shape("blk."+std::to_string(l)+".ple_conv1d.weight", {4,10240});
+  for(int l : {1}) shape("blk."+std::to_string(l)+".ple_key.weight", {2560,10240});
+  for(int l : {1}) shape("blk."+std::to_string(l)+".ple_norm_conv.weight", {10240});
+  for(int l : {1}) shape("blk."+std::to_string(l)+".ple_norm_key.weight", {10240});
+  for(int l : {1}) shape("blk."+std::to_string(l)+".ple_norm_query.weight", {10240});
+  for(int l : {1}) shape("blk."+std::to_string(l)+".ple_value.weight", {2560,2560});
+  for(int l : {0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30,32,33,34,36,37,38,40,41,42,44,45,46}) shape("blk."+std::to_string(l)+".ssm_a", {48});
+  for(int l : {0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30,32,33,34,36,37,38,40,41,42,44,45,46}) shape("blk."+std::to_string(l)+".ssm_alpha.weight", {2560,48});
+  for(int l : {0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30,32,33,34,36,37,38,40,41,42,44,45,46}) shape("blk."+std::to_string(l)+".ssm_beta.weight", {2560,48});
+  for(int l : {0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30,32,33,34,36,37,38,40,41,42,44,45,46}) shape("blk."+std::to_string(l)+".ssm_conv1d.weight", {4,10240});
+  for(int l : {0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30,32,33,34,36,37,38,40,41,42,44,45,46}) shape("blk."+std::to_string(l)+".ssm_dt.bias", {48});
+  for(int l : {0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30,32,33,34,36,37,38,40,41,42,44,45,46}) shape("blk."+std::to_string(l)+".ssm_norm.weight", {128});
+  for(int l : {0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22,24,25,26,28,29,30,32,33,34,36,37,38,40,41,42,44,45,46}) shape("blk."+std::to_string(l)+".ssm_out.weight", {6144,2560});
+  shape("output.weight", {2560,248320});
+  shape("output_hc_down.weight", {10240,320});
+  shape("output_hc_norm.weight", {10240});
+  shape("output_hc_up.weight", {320,10240});
+  shape("per_layer_token_embd.weight", {160,320001536});
+  shape("token_embd.weight", {2560,248320});
+}
+} // namespace chlorine_flash

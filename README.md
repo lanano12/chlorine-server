@@ -16,6 +16,13 @@ its EULA permits reverse engineering and interoperability. This codebase is
 built from the behavioral specifications, HIP kernels and attributed
 open-source numerical routines.
 
+## Flash-Next backend
+
+The separate [Chlorine Flash backend](engine/flash/README.md) targets
+Qwen3.8-Flash-Next. It builds from pinned AGPL source and adds the local
+mixed-IQ GGUF formats. Host checks pass; GPU/model qualification and throughput
+are still pending. Its binaries, ports and results are separate from 27B.
+
 ## Status
 
 Work in progress — see [docs/halogen/REBUILD-PLAN.md](docs/halogen/REBUILD-PLAN.md).
