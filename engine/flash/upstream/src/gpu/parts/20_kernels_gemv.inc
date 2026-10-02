@@ -1173,7 +1173,7 @@ __global__ void k_gdn_gates(const float* __restrict__ a, const float* __restrict
                             const float* __restrict__ A_log,
                             const float* __restrict__ dt_bias,
                             float* __restrict__ g_out, float* __restrict__ beta_out,
-                            int hv, int stride) {
+                            int hv, int stride, bool direct_coefficient=false) {
   int h = threadIdx.x;
   if (h >= hv) return;
   size_t off = (size_t)blockIdx.x * stride;
@@ -1183,7 +1183,7 @@ __global__ void k_gdn_gates(const float* __restrict__ a, const float* __restrict
   beta_out += off;
   float sp = a[h] + dt_bias[h];
   sp = sp > 20.f ? sp : log1pf(expf(sp));
-  g_out[h] = -expf(A_log[h]) * sp;
+  g_out[h] = (direct_coefficient ? A_log[h] : -expf(A_log[h])) * sp;
   beta_out[h] = 1.f / (1.f + expf(-b[h]));
 }
 

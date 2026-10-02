@@ -129,6 +129,17 @@ inline void add_q8(hgn::Checkpoint& ck, const std::string& name, const gguf::Ten
   put(ck, d, std::move(buf));
 }
 
+// Keep the local Q6_K head packed. No host expansion, BF16 rounding or requantization.
+// The GGUF mapping stays alive until the arena upload completes.
+inline void add_head(hgn::Checkpoint& ck,const gguf::Tensor& t) {
+  need(t.nd==2 && t.ne[0]==2560 && t.ne[1]==248320,"output.weight shape mismatch");
+  if(t.type==gguf::Q8_0) {add_q8(ck,"lm_head.weight",t,{248320,2560});return;}
+  need(t.type==gguf::Q6_K,"output.weight: expected Q6_K or Q8_0, got "+std::string(gguf::type_name(t.type)));
+  need(t.nbytes==gguf::checked_mul(t.rows(),t.row_bytes()),"output.weight: packed size mismatch");
+  auto d=desc("lm_head.weight",12,{248320,2560});d.data=t.data;d.data_size=t.nbytes;
+  if(!g_keep || g_keep(d.name))ck.add_view(d);
+}
+
 // any GGUF type -> f32 [R'][C] with source row map
 inline std::vector<float> rows_f32(const gguf::Tensor& t, const Map& rows = {}) {
   const uint64_t C = t.ne[0], R = t.rows(), rb = t.row_bytes();
@@ -174,6 +185,21 @@ inline std::vector<float> norm_vec(const gguf::Tensor& t, bool fold) {
   if (fold)
     for (float& x : v) x -= 1.f;
   return v;
+}
+// Keep the GGUF coefficient beside compatibility A_log; no lossy reinterpretation.
+inline void add_decay(hgn::Checkpoint& ck,const std::string& prefix,
+                      const std::vector<float>& a,const std::vector<float>& dt,const Map& heads) {
+  need(a.size()==48 && dt.size()==48 && heads.size()==48,prefix+"decay shape mismatch");
+  std::vector<float> alog(48),coefficient(48),bias(48);
+  for(size_t h=0;h<48;h++) {
+    need(heads[h]<48,prefix+"decay head out of range");
+    const float value=a[heads[h]],d=dt[heads[h]];
+    need(std::isfinite(value) && value<0 && std::isfinite(d),prefix+"invalid ssm_a/dt value");
+    coefficient[h]=value;alog[h]=logf(-value);bias[h]=d;
+  }
+  add_f32v(ck,prefix+"A_log",alog,{48});
+  add_f32v(ck,prefix+"A_coeff",coefficient,{48});
+  add_f32v(ck,prefix+"dt_bias",bias,{48});
 }
 inline void add_u64(hgn::Checkpoint& ck, const std::string& name, const gguf::File& g,
                     const std::string& key, size_t n) {
@@ -252,13 +278,7 @@ inline void build_layer(hgn::Checkpoint& ck, const gguf::File& g, int bl, const 
   add_f32v(ck, L + "conv1d.weight", rows_f32(G("ssm_conv1d.weight"), mqkv), {10240, 1, 4});
   std::vector<float> a = rows_f32(G("ssm_a")), dt = rows_f32(G("ssm_dt.bias"));
   need(a.size() == 48 && dt.size() == 48, B + "ssm_a/dt shapes");
-  std::vector<float> alog(48), dtb(48);
-  for (uint32_t h = 0; h < 48; h++) {
-    alog[h] = logf(-a[vhead(o, h)]);
-    dtb[h] = dt[vhead(o, h)];
-  }
-  add_f32v(ck, L + "A_log", alog, {48});
-  add_f32v(ck, L + "dt_bias", dtb, {48});
+  add_decay(ck,L,a,dt,m48);
   add_f32v(ck, L + "norm.weight", norm_vec(G("ssm_norm.weight"), o.fold_ssm), {128});
 }
 
@@ -276,7 +296,7 @@ inline size_t build(hgn::Checkpoint& ck, const gguf::File& g, const gguf::File* 
   }
   if (o.globals) {
     add_q8(ck, "embed_tokens.weight", g.at("token_embd.weight"), {248320, 2560});
-    add_q8(ck, "lm_head.weight", g.at("output.weight"), {248320, 2560});
+    add_head(ck,g.at("output.weight"));
     add_q8(ck, "hyper_connection_mixer.input_mix_weight_down.weight", g.at("output_hc_down.weight"),
            {320, 10240});
     add_q8(ck, "hyper_connection_mixer.input_mix_weight_up.weight", g.at("output_hc_up.weight"),

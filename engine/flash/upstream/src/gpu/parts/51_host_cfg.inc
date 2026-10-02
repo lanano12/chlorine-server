@@ -1044,6 +1044,8 @@ static uint64_t fingerprint(const GpuModel& m) {
   // Persisted states from different convolution/hash semantics cannot mix.
   add(0x4348504c45000100ULL + (uint64_t)chlorine_flash::ple_causal);
   add(chlorine_flash::ple_ring_slots);
+  add(0x4348444543415900ULL+(uint64_t)m.gdn_direct_coeff);
+  add((uint64_t)m.ckpt.at("lm_head.weight").dtype);
   for (uint64_t v : {(uint64_t)m.ple_on, (uint64_t)G.kvb, (uint64_t)G.has_ik,
                      (uint64_t)G.nqsa, (uint64_t)g_cfg.layers, (uint64_t)g_cfg.d,
                      (uint64_t)g_cfg.branches, (uint64_t)KV_PAGE})
@@ -2699,6 +2701,8 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
            << ",\"mtp_weights_loaded\":" << (m.mtp_avail ? "true" : "false")
            << ",\"gpu_qualified\":false,\"model_qualified\":false,\"vision_qualified\":false"
            << ",\"ple_semantics\":\"" << chlorine_flash::ple_semantics << "\""
+           << ",\"gdn_decay_semantics\":\"" << chlorine_flash::decay_semantics(m.gdn_direct_coeff) << "\""
+           << ",\"head_dtype\":" << m.ckpt.at("lm_head.weight").dtype
            << ",\"manifest_sha256\":\"" << digest("CHLORINE_FLASH_MANIFEST_SHA256") << "\""
            << ",\"binary_sha256\":\"" << digest("CHLORINE_FLASH_BINARY_SHA256") << "\"}\n";
       alive = c.send(caps.str());

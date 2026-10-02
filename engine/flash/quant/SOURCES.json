@@ -6,5 +6,13 @@
     "ggml/src/ggml-common.h": "9cb781b415d9828f553c7345eef400eca10deaeb3c50f66cb9eaf0394cc2010a",
     "ggml/src/ggml-quants.c": "9c8cde02e69717e716a0908e1b4345b93867c12787c80dd101b98fbfc0cb81ec"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "q6_reference": {
+    "local_source_repository": "git@github.com:lanano12/llama.cpp.git",
+    "revision": "c8dbe9236f2af0150aaab3acd37fb2aee9638a19",
+    "source": "ggml/src/ggml-quants.c",
+    "source_sha256": "07143d7068936ae46b3c528b2f3d4bbb666e74d88992165716174d243573965d",
+    "function": "dequantize_row_q6_K",
+    "license": "MIT"
+  }
 }

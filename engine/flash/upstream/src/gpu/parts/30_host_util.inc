@@ -746,7 +746,10 @@ static void gemv(const WView& w, const float* x, float* y, uint64_t row_off = 0,
   int warps_per_block = 8;
   int threads = warps_per_block * 64;
   uint64_t blocks = (rows + warps_per_block - 1) / warps_per_block;
-  if (w.dtype == 1) {
+  if (w.dtype == 12) {
+    if(row_off>w.rows || rows>w.rows-row_off)throw std::runtime_error("Q6_K GEMV row range");
+    flash_q6_gemv(w.data+row_off*(w.cols/256)*210,x,y,rows,w.cols,1,w.cols,false,g_str);
+  } else if (w.dtype == 1) {
     k_flash_f32_gemv<<<dim3((unsigned)rows,1),256,0,g_str>>>(
       (const float*)w.data+row_off*w.cols,x,y,(int)rows,(int)w.cols,w.cols);
   } else if (w.dtype == 5) {
@@ -818,6 +821,10 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
   if (getenv("GDEC_NO_GEMVMR")) return false;
   if (P < 1 || P > 8) return false;
   if (!xstride) xstride = w.cols;
+  if(w.dtype==12) {
+    flash_q6_gemv(w.data,x,y,w.rows,w.cols,P,xstride,xbf16,g_str);
+    return true;
+  }
   if (xbf16) {
     if (xstride % 8 || (((uintptr_t)x | (uintptr_t)y) & 15)) return false;
   } else if (xstride % 4 || (((uintptr_t)x | (uintptr_t)y) & 15))
@@ -1058,4 +1065,3 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
   }
   return true;
 }
-

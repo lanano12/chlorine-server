@@ -87,6 +87,36 @@ static bool flash_moe_gemv(int gu,int dn,const uint8_t* gate,const uint8_t* up,
   return true;
 }
 // F32 matrices remain F32 in the GGUF mapping (routers, HC injection, GDN gates).
+// Q6_K vocabulary head. One wave per output row; share decoded weights across
+// up to eight inputs. P=1 and multi-row use the same accumulation/reduction order.
+template<bool XBf16=false>
+__global__ void k_flash_q6_gemv(const uint8_t* w,const void* x,float* out,
+                              int rows,int cols,int P,size_t xs) {
+  const int lane=threadIdx.x%32,r=blockIdx.x*8+threadIdx.x/32;
+  if(r>=rows)return;
+  const uint8_t* row=w+(size_t)r*(cols/256)*210;
+  float sum[8]={};
+  for(int c=lane;c<cols;c+=32) {
+    const float weight=flash_quant::value(14,row,c);
+    for(int t=0;t<P;t++) {
+      const float xv=XBf16 ? __uint_as_float(unsigned(((const uint16_t*)x)[t*xs+c])<<16)
+                          : ((const float*)x)[t*xs+c];
+      sum[t]+=weight*xv;
+    }
+  }
+  for(int t=0;t<P;t++) {
+    float v=sum[t];
+    for(int offset=16;offset;offset>>=1)v+=__shfl_down(v,offset,32);
+    if(lane==0)out[(size_t)t*rows+r]=v;
+  }
+}
+static void flash_q6_gemv(const uint8_t* w,const void* x,float* out,int rows,
+                         int cols,int P,size_t xs,bool bf16,hipStream_t st) {
+  if(rows<1 || cols<1 || cols%256 || P<1 || P>8 || xs<(size_t)cols)
+    throw std::runtime_error("flash Q6_K GEMV: invalid shape");
+  if(bf16)k_flash_q6_gemv<true><<<(rows+7)/8,256,0,st>>>(w,x,out,rows,cols,P,xs);
+  else k_flash_q6_gemv<false><<<(rows+7)/8,256,0,st>>>(w,x,out,rows,cols,P,xs);
+}
 __global__ void k_flash_f32_gemv(const float* w,const float* x,float* out,int n,int k,size_t xs) {
   int r=blockIdx.x,t=blockIdx.y,tid=threadIdx.x;
   float v=0;for(int c=tid;c<k;c+=256)v+=w[(size_t)r*k+c]*x[(size_t)t*xs+c];

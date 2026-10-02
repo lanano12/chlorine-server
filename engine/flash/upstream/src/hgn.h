@@ -21,9 +21,12 @@
 //   dtype 11 IQ4_NL rows (GGUF PLE n-gram table, a borrowed view of the mmap):
 //            per row cols/32 blocks of 18 B [fp16 d][16 B nibbles];
 //            w[32b+j] = d * kvalues_iq4nl[lo nibble of byte j], w[32b+16+j] = .. hi
+//   dtype 12 Q6_K packed rows, borrowed from GGUF (210 bytes / 256 values).
+//            Internal only: never accepted as an on-disk HGN dtype.
 #pragma once
 
 #include <algorithm>
+#include "../../quant/iq_decode.hpp"
 #include <limits>
 #include <unordered_set>
 #include <cmath>
@@ -164,6 +167,12 @@ public:
   void dequant(const Tensor& t, float* out) const {
     uint64_t n = t.numel();
     switch (t.dtype) {
+      case 12: {
+        if(!t.ndims || t.dims[t.ndims-1]%256 || n/256*210!=t.data_size)
+          throw std::runtime_error("Q6_K size mismatch on " + t.name);
+        for(uint64_t i=0;i<n;i++)out[i]=flash_quant::value(14,t.data,i);
+        break;
+      }
       case 0: {
         const uint16_t* p = (const uint16_t*)t.data;
         for (uint64_t i = 0; i < n; i++) out[i] = bf16_to_f32(p[i]);

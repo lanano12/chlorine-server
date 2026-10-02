@@ -372,6 +372,11 @@ inline void scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
 
 // Dequantize one row of `k` elements of type `t` starting at `src`.
 inline void dequant_row(uint32_t t, const uint8_t* src, float* y, uint64_t k) {
+  if(t==Q6_K) {
+    if(k%256)throw std::runtime_error("gguf: Q6_K row is not block-aligned");
+    for(uint64_t i=0;i<k;i++)y[i]=flash_quant::value(Q6_K,src,i);
+    return;
+  }
   (void)row_bytes(t,k); // reject incomplete blocks before decoding
   if (t == IQ3_S) {
     for (uint64_t i=0;i<k;++i) y[i]=flash_quant::value(IQ3_S,src,i);

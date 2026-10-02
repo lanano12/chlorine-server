@@ -38,6 +38,8 @@ class HGNTests(unittest.TestCase):
         for f in ({'rank':0},{'rank':5},{'dim':0},{'dim':2**63},{'dtype':21},{'offset':321},{'offset':2**64-1},{'size':63},{'name':b'x'*96}):self.check(fixture(**f))
     def test_quant_alignment(self):
         self.check(fixture(dtype=7,dim=32));self.check(fixture(dtype=5,dim=33))
+    def test_internal_q6_dtype_is_not_an_on_disk_abi(self):
+        self.check(fixture(dtype=12))
     def test_duplicate_and_overlap(self):
         for name,offset in ((b'test',512),(b'other',448)):
             h=HEADER.pack(b'HGN1',2,2,0,104,448,576,b'fixture')

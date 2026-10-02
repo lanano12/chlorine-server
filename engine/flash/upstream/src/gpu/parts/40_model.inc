@@ -38,6 +38,7 @@ struct GpuModel {
   float* d_convst = nullptr;              // (gdn_layers, 3, 10240)
   float* d_convw = nullptr;               // (gdn_layers, 10240, 4) fp32
   float *d_Alog, *d_dtbias;               // (gdn_layers, 48)
+  bool gdn_direct_coeff=false;           // d_Alog then holds the stored negative coefficient
   float* d_gdnnorm = nullptr;             // (gdn_layers, 128)
   float *d_kc = nullptr, *d_vc = nullptr;  // (qsa_layers, maxctx, 512), FP32 mode
   uint16_t *d_kcb = nullptr, *d_vcb = nullptr;  // BF16 KV cache (default mode)
@@ -731,6 +732,7 @@ struct GpuModel {
       ckpt.dequant(ckpt.at(name), tmp.data());
       CK(hipMemcpy(dst, tmp.data(), n * 4, hipMemcpyHostToDevice));
     };
+    gdn_direct_coeff=chlorine_flash::direct_decay_requested && g_gguf_dense;
     int gi = 0;
     for (int l = 0; l < g_cfg.layers; l++) {
       if (is_qsa(l)) {
@@ -748,7 +750,7 @@ struct GpuModel {
       }
       snprintf(buf, sizeof buf, "layers.%d.linear_attn.conv1d.weight", l);
       upload(buf, d_convw + (size_t)gi * 10240 * 4, 10240 * 4);
-      snprintf(buf, sizeof buf, "layers.%d.linear_attn.A_log", l);
+      snprintf(buf, sizeof buf, "layers.%d.linear_attn.%s", l,gdn_direct_coeff?"A_coeff":"A_log");
       upload(buf, d_Alog + (size_t)gi * 48, 48);
       snprintf(buf, sizeof buf, "layers.%d.linear_attn.dt_bias", l);
       upload(buf, d_dtbias + (size_t)gi * 48, 48);
@@ -1302,7 +1304,7 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_b.weight", l);
     gemv(wview(ckpt.at(buf)), x, d_beta48 /*tmp: raw b*/);
     k_gdn_gates<<<1, 64, 0, g_str>>>(d_g48, d_beta48, d_Alog + (size_t)gi * 48,
-                           d_dtbias + (size_t)gi * 48, d_g48, d_beta48, 48, 48);
+                           d_dtbias + (size_t)gi * 48, d_g48, d_beta48, 48, 48,gdn_direct_coeff);
     k_gdn_step<<<48, 512, 0, g_str>>>(qp, kp, vp, d_g48, d_beta48,
                             d_S + (size_t)gi * 48 * 128 * 128, vp /*out in place*/,
                             128, 128, 48, 16);
@@ -1840,6 +1842,15 @@ struct GpuModel {
     auto pt0 = std::chrono::steady_clock::now();
     uint64_t N = w.rows, K = w.cols;
     if (!xstride) xstride = K;
+    if(w.dtype==12) {
+      // The head is kept packed even when scoring more than eight rows.
+      for(int start=0;start<P;start+=8) {
+        const void* input=xbf ? (const void*)(xbf+(size_t)start*K) : (const void*)(x+(size_t)start*xstride);
+        flash_q6_gemv(w.data,input,y+(size_t)start*N,N,K,std::min(8,P-start),xbf?K:xstride,xbf!=nullptr,g_str);
+      }
+      if(prof)p_gemm+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-pt0).count();
+      return;
+    }
     // Preserve GGUF FP32 router/gate matrices and FP32 activations.
     if(w.dtype == 1) {
       if (!x) throw std::runtime_error("flash f32 gemm requires float input");
@@ -2367,7 +2378,7 @@ struct GpuModel {
       if (!cl2)
         k_l2norm_qk_b<<<dim3(16, P), 128, 0, g_str>>>(d_convb, 128, qscale, 10240, 16);
       k_gdn_gates<<<P, 64, 0, g_str>>>(d_g48b, d_beta48b, Alog, dtb, d_g48b, d_beta48b,
-                                       48, 48);
+                                       48, 48,gdn_direct_coeff);
       if (spec_snap) {
         int ngdn = g_cfg.layers - g_cfg.layers / 4;
         k_gdn_snap<<<48, 512, 0, g_str>>>(
@@ -2461,7 +2472,7 @@ struct GpuModel {
       k_gdn_conv<<<(10240 + 255) / 256, 256, 0, g_str>>>(qkv, cw, convst, qkv, 10240);
       k_l2norm_qk<<<16, 128, 0, g_str>>>(qkv, qkv + 2048, 128, qscale);
       k_gdn_gates<<<1, 64, 0, g_str>>>(d_g48b + t * 48, d_beta48b + t * 48, Alog, dtb,
-                                       d_g48b + t * 48, d_beta48b + t * 48, 48, 48);
+                                       d_g48b + t * 48, d_beta48b + t * 48, 48, 48,gdn_direct_coeff);
       k_gdn_step<<<48, 512, 0, g_str>>>(qkv, qkv + 2048, qkv + 4096, d_g48b + t * 48,
                                         d_beta48b + t * 48, S, qkv + 4096, 128, 128, 48,
                                         16);

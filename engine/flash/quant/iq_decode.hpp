@@ -40,6 +40,15 @@ FLASH_HD int grid4(int i) {
 }
 // Caller checks type and row/block alignment once, before dispatch.
 FLASH_HD float value(int type, const uint8_t* row, uint64_t col) {
+  if(type==14) { // Q6_K: 128 low bytes, 64 high bytes, 16 int8 scales, half d.
+    const uint8_t* b=row+(col/256)*210;
+    const unsigned j=col%256, half=j/128, within=j%128, lane=within%32, group=within/32;
+    const unsigned low=b[half*64+(group%2)*32+lane];
+    const unsigned code=((low>>(group>=2?4:0))&15) |
+                        (((b[128+half*32+lane]>>(group*2))&3)<<4);
+    const int scale=int(int8_t(b[192+half*8+group*2+lane/16]));
+    return (half_value(u16(b+208))*float(scale))*float(int(code)-32);
+  }
   if(type==21) {
     const uint8_t* b=row+(col/256)*110;
     const unsigned j=col%256, sub=j/32, t=j%32, group=t/8, half=(t%8)/4;
