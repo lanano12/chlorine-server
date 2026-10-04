@@ -7,6 +7,13 @@ int main() {
     {"context",33024},{"prefill_chunk",2048},{"slots",1},{"gpu_qualified",false},{"model_qualified",false},{"vision_qualified",false}};
   auto parse=[](const json& j){return chlorine_flash::parse_capabilities("C "+j.dump());};
   if(parse(base).at("ple_semantics")!="causal-dilation3-v1")return 1;
+  for(bool enabled:{false,true}) {
+    auto j=base;j["diagnostic_trace"]=enabled;
+    if(parse(j)["diagnostic_trace"]!=enabled)return 1;
+  }
+  auto bad_trace=base;bad_trace["diagnostic_trace"]=nullptr;
+  bool trace_rejected=false;try{parse(bad_trace);}catch(const std::exception&){trace_rejected=true;}
+  if(!trace_rejected)return 1;
   for(const char* semantic:{"causal-dilation3-v1","legacy-nine-slot-alias-v1"}) {
     auto j=base;j["ple_semantics"]=semantic;if(parse(j)["ple_semantics"]!=semantic)return 1;
   }

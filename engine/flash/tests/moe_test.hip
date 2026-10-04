@@ -260,6 +260,25 @@ int main(int argc, char** argv) {
   CK(hipMemcpy(hid.data(), d_hid, hid.size() * 2, hipMemcpyDeviceToHost));
   CK(hipMemcpy(pairs.data(), d_pairs, pairs.size() * 4, hipMemcpyDeviceToHost));
   bool ok = true;
+  if (t_gu == 21) {
+    // The LUT-staged IQ3_S kernel must reproduce the original per-element kernel exactly.
+    __half* d_hid2;
+    CK(hipMalloc(&d_hid2, hid.size() * 2));
+    CK(hipMemset(d_hid2, 0xFF, hid.size() * 2));
+    k_flash_iq3_up<<<dim3((MID + 63) / 64, max_tiles), 256, 0, 0>>>(pgu.w, pgu.w_up, d_x, d_tok, d_tiles, d_nt, d_hid2, MID, D);
+    CK(hipGetLastError());
+    CK(hipDeviceSynchronize());
+    std::vector<__half> hid2(hid.size());
+    CK(hipMemcpy(hid2.data(), d_hid2, hid2.size() * 2, hipMemcpyDeviceToHost));
+    CK(hipFree(d_hid2));
+    const size_t diffs = std::memcmp(hid.data(), hid2.data(), hid.size() * 2) == 0 ? 0 : [&] {
+      size_t n = 0;
+      for (size_t i = 0; i < hid.size(); i++) n += std::memcmp(&hid[i], &hid2[i], 2) != 0;
+      return n;
+    }();
+    printf("iq3s: LUT-staged vs original kernel bit_diffs %zu / %zu\n", diffs, hid.size());
+    if (diffs) ok = false;
+  }
   size_t nan_h = 0, nan_p = 0;
   for (auto v : hid) nan_h += !std::isfinite(h2f(v));
   for (auto v : pairs) nan_p += !std::isfinite(v);

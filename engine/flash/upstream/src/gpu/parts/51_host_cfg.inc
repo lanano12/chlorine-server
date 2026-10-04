@@ -1998,6 +1998,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     c.in_flight = false;
     if (!c.send(d)) sock_shutdown(c.fd);
   };
+  if (m.trace.active() && (g.drafter > 0 || g.sample || g.vimg > 0 || !g.mrope_grids.empty())) {
+    fprintf(stderr, "trace: require serial greedy text-only diagnostic request\n");
+    finish(err_line());return;
+  }
   // Vision request validation (0.5.8 semantics), before state mutation:
   // patches need a loaded tower and one MROPE grid each; any image
   // placeholder without a grid is rejected (first position logged).
@@ -2082,6 +2086,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
             (long long)g.req, s, hist.size());
   try {
     // KV reuse: longest common prefix of live state and this prompt.
+    // Diagnostic traces require complete fresh rows, including the prefix.
+    if (m.trace.active()) { hist.clear(); mtp_live = false; }
     // Continue only when hist is a STRICT prefix (mcp == hist.size() and
     // new tokens follow); anything else falls to the SSD snapshot cache
     // and only then to a full recompute.
@@ -2702,6 +2708,7 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
            << ",\"gpu_qualified\":false,\"model_qualified\":false,\"vision_qualified\":false"
            << ",\"ple_semantics\":\"" << chlorine_flash::ple_semantics << "\""
            << ",\"gdn_decay_semantics\":\"" << chlorine_flash::decay_semantics(m.gdn_direct_coeff) << "\""
+           << ",\"diagnostic_trace\":" << (m.trace.active() ? "true" : "false")
            << ",\"head_dtype\":" << m.ckpt.at("lm_head.weight").dtype
            << ",\"manifest_sha256\":\"" << digest("CHLORINE_FLASH_MANIFEST_SHA256") << "\""
            << ",\"binary_sha256\":\"" << digest("CHLORINE_FLASH_BINARY_SHA256") << "\"}\n";

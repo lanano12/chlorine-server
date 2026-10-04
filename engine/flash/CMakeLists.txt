@@ -18,6 +18,16 @@ add_executable(flash-quant-test tests/quant_test.cpp)
 add_executable(flash-map-test tests/map_test.cpp)
 add_executable(flash-q6-test tests/q6_test.cpp)
 add_executable(flash-mapping-test tests/mapping_test.cpp)
+add_executable(flash-index-reference tests/index_reference_test.cpp)
+target_compile_options(flash-index-reference PRIVATE -ffp-contract=off)
+add_test(NAME flash-index-reference COMMAND flash-index-reference)
+add_executable(flash-attention-reference tests/attention_reference_test.cpp)
+target_compile_options(flash-attention-reference PRIVATE -ffp-contract=off)
+add_test(NAME flash-attention-reference COMMAND flash-attention-reference)
+add_executable(flash-mtp-state-reference tests/mtp_state_reference_test.cpp)
+add_test(NAME flash-mtp-state-reference COMMAND flash-mtp-state-reference)
+add_executable(flash-trace-test tests/trace_test.cpp)
+add_test(NAME flash-trace-writer COMMAND flash-trace-test)
 target_compile_options(flash-mapping-test PRIVATE -ffp-contract=off)
 add_test(NAME flash-mapping COMMAND flash-mapping-test)
 target_compile_options(flash-q6-test PRIVATE -ffp-contract=off)
@@ -33,6 +43,17 @@ add_test(NAME flash-map COMMAND flash-map-test)
 target_compile_options(flash-quant-test PRIVATE -ffp-contract=off)
 add_test(NAME flash-quant COMMAND flash-quant-test)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME flash-attention-fixtures COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/attention_fixture_test.py $<TARGET_FILE:flash-attention-reference>
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/attention_reference.json)
+add_test(NAME flash-trace-compare COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/trace_compare_test.py $<TARGET_FILE:flash-trace-test>)
+add_test(NAME flash-index-fixtures COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/index_fixture_test.py $<TARGET_FILE:flash-index-reference>
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/index_reference.json)
+add_test(NAME flash-index-model-fixtures COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/index_fixture_test.py $<TARGET_FILE:flash-index-reference>
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/index_model_reference.json)
 add_test(NAME flash-ple-host COMMAND ${Python3_EXECUTABLE}
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/ple_fixture_test.py $<TARGET_FILE:flash-ple-causal>
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ple_reference.json)
@@ -52,7 +73,7 @@ if(FLASH_BUILD_GPU)
       --hipcc ${HIPCC_EXECUTABLE} --ple-causal $<BOOL:${FLASH_PLE_CAUSAL}>
       --gguf-direct-decay $<BOOL:${FLASH_GGUF_DIRECT_DECAY}>
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/chlorine-flash.build.json
-    DEPENDS ${FLASH_HIP_DEPS} model_config.hpp ple_contract.hpp mapping_contract.hpp write_build_info.py VERBATIM)
+    DEPENDS ${FLASH_HIP_DEPS} model_config.hpp ple_contract.hpp mapping_contract.hpp trace.hpp write_build_info.py VERBATIM)
   add_custom_target(flash-engine ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/chlorine-flash)
 endif()
 if(FLASH_BUILD_API)
@@ -73,13 +94,13 @@ if(FLASH_BUILD_API)
 endif()
 if(FLASH_BUILD_GPU)
   file(GLOB_RECURSE FLASH_TEST_DEPS CONFIGURE_DEPENDS tests/*.hpp)
-  foreach(check IN ITEMS moe_test index_fast_test gdn_verify_test gemv_test ple_test mapping_gpu_test)
+  foreach(check IN ITEMS moe_test index_fast_test gdn_verify_test gemv_test ple_test mapping_gpu_test index_reference_gpu_test attention_reference_gpu_test)
     add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${check}
       COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -Werror ${FLASH_SEMANTIC_FLAGS}
         -I${CMAKE_CURRENT_SOURCE_DIR}/upstream/src/gpu
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/${check}.hip -lrocblas -lhipblaslt
         -o ${CMAKE_CURRENT_BINARY_DIR}/${check}
-      DEPENDS tests/${check}.hip ${FLASH_TEST_DEPS} ${FLASH_HIP_DEPS} model_config.hpp ple_contract.hpp mapping_contract.hpp VERBATIM)
+      DEPENDS tests/${check}.hip ${FLASH_TEST_DEPS} ${FLASH_HIP_DEPS} model_config.hpp ple_contract.hpp mapping_contract.hpp trace.hpp VERBATIM)
     add_custom_target(${check}-build ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${check})
   endforeach()
   foreach(format IN ITEMS iq3s iq4xs iq4nl)
@@ -93,9 +114,11 @@ if(FLASH_BUILD_GPU)
   add_test(NAME flash-index COMMAND ${CMAKE_CURRENT_BINARY_DIR}/index_fast_test --quick)
   add_test(NAME flash-gdn COMMAND ${CMAKE_CURRENT_BINARY_DIR}/gdn_verify_test)
   add_test(NAME flash-mapping-gpu COMMAND ${CMAKE_CURRENT_BINARY_DIR}/mapping_gpu_test)
+  add_test(NAME flash-index-reference-gpu COMMAND ${CMAKE_CURRENT_BINARY_DIR}/index_reference_gpu_test)
+  add_test(NAME flash-attention-reference-gpu COMMAND ${CMAKE_CURRENT_BINARY_DIR}/attention_reference_gpu_test)
   add_test(NAME flash-ple-gpu COMMAND ${CMAKE_CURRENT_BINARY_DIR}/ple_test
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ple_reference.json)
-  set_tests_properties(flash-index flash-gdn flash-gemv flash-ple-gpu flash-mapping-gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+  set_tests_properties(flash-index flash-gdn flash-gemv flash-ple-gpu flash-mapping-gpu flash-index-reference-gpu flash-attention-reference-gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
 endif()
 if(FLASH_BUILD_API)
   add_executable(flash-tok upstream/src/api/tokenizer.cpp upstream/src/api/tok_cli.cpp)

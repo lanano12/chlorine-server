@@ -1,6 +1,6 @@
 # Chlorine Flash backend
 
-Source-compiled Qwen3.8-Flash-Next for gfx1151. This is the first checkpoint-compatibility implementation, **not a qualified model release**. The engine and HTTP API compile. CPU format/mapping/template checks pass; GPU operators, real model tokens, long context, speculation and throughput are unverified.
+Source-compiled Qwen3.8-Flash-Next for gfx1151. This is the first checkpoint-compatibility implementation, **not a qualified model release**. The engine and HTTP API compile, CPU format/mapping/template checks pass, all 22 GPU operator tests pass on gfx1151, and the local UD-IQ4_XS GGUF loads and generates (2026-10-03). A full-precision model reference, long context, speculation and admitted throughput are unverified.
 
 The complete 48-layer Flash architecture is imported from the pinned AGPL gfx1151-engine, independently of the existing 27B engine. Chlorine additions cover the local mixed IQ3_S/IQ4_XS/IQ4_NL/Q8_0 experts, stronger file validation, preserved F32 small projections, independently checked PLE/tokenizer semantics, build/tests and controlled service defaults. See the parent repository's [`variant-flash/STATUS.md`](../../../variant-flash/STATUS.md) and [`IMPLEMENTATION.md`](../../../variant-flash/IMPLEMENTATION.md) for acceptance gates. Independent CPU checks do not qualify GPU/model behavior.
 
@@ -16,11 +16,25 @@ ctest --test-dir variant-flash/build-local --output-on-failure
 
 Requirements: CMake 3.20+, C++17, Python 3, ROCm hipcc with gfx1151 support, rocBLAS, hipBLASLt, libpng, libjpeg and libwebp. Python fixture rendering additionally needs Jinja2. Configure `-DFLASH_BUILD_GPU=OFF -DFLASH_BUILD_API=OFF` for host-only reader/quantization/mapping tests. GPU tests return skip code 77 when no HIP device exists; a skipped test never qualifies a kernel.
 
-Main outputs: `flash-q6-test`, `flash-mapping-test`, `chlorine-flash`, `chlorine-flash-api`, `chlorine-flash-inspect`, `flash-tok`, `flash-template`, `flash-tokenizer-metadata`. Builds belong outside the source directory and are not committed.
+Main outputs: `flash-q6-test`, `flash-mapping-test`, `flash-index-reference`, `flash-attention-reference`, `flash-trace-test`, `chlorine-flash`, `chlorine-flash-api`, `chlorine-flash-inspect`, `flash-tok`, `flash-template` and `flash-tokenizer-metadata`. Builds belong outside the source directory and are not committed.
+
+The pinned CPU index/attention oracles and bounded trace comparator are described in the parent [Flash diagnostic guide](../../../variant-flash/DIAGNOSTICS.md). Two GPU tests compare actual indexer and attention operators against those references. Return code 77 means device unavailable; neither these tests nor the host references qualify a complete model. The parent's `variant-flash/bench/model_reference.py` compares the loaded model with llama.cpp's `qwen4exp` on the same GGUF. The current candidate and test results are in [Flash STATUS](../../../variant-flash/STATUS.md).
 
 `FLASH_PLE_CAUSAL` defaults **OFF** to preserve the separately named `legacy-nine-slot-alias-v1` behavior. The example explicitly selects the candidate `causal-dilation3-v1`: ten ring slots preserve the back-nine tap, zero gate dots produce 0.5, and n-gram predecessors reset at EOS. Both CPU modes are built for comparison. The causal operator matches frozen independent Qwen4-Exp/PyTorch fixtures; GPU and complete model qualification are pending. Cache fingerprints and all ring allocation/snapshot/restore paths carry the selected semantics. The imported `upstream/src/ref.cpp` remains a legacy reference, not an independent oracle for the new mode.
 
 Each successful engine build writes `chlorine-flash.build.json`, binding its SHA256 to the compiler command, PLE/decay modes and source-file hashes. Measurement requires this record; missing or mismatched provenance is an error. Preserve existing `build-f1`, `build-f2-causal` and `build-f2-mapping` artifacts and use a new directory for later candidates.
+
+## Speed paths and switches (2026-10-04)
+
+Three kernel changes are always on and bit-identical to what they replace: IQ3_S experts run on the staged lookup-table prefill kernel (`k_moe_lut<kIQ3S>`), the expert decode GEMV loads IQ3_S/IQ4_NL/IQ4_XS units a block at a time, and the Q6_K head decodes a block at a time. `moe_test`, `gemv_test` and `mapping_gpu_test` compare each with its retained per-element reference and require zero differing bits. `GDEC_FLASH_IQ3_SCALAR=1` selects the original IQ3_S prefill kernel.
+
+Opt-in switches that change arithmetic, passed through the supervisor's `--engine-env`:
+
+- `GDEC_F32_GEMM_BF16=1`: batched GEMMs (more than 8 rows) on F32 GGUF matrices take the bf16 paths. A matrix qualifies only if every value is exact in bf16, checked on device at first use; the weights then lose nothing and the activations are rounded to bf16 as for the quantized matrices.
+- `GDEC_GR_BF16=1`: bf16 residual stream in batched prefill. Rejected for GGUF unless `GDEC_F32_GEMM_BF16=1` is also set.
+- The imported production switches (`GDEC_QSA_KV_BF16`, `GDEC_QSA_WMMA`, `GDEC_QSA_WMMA_BTV`, `GDEC_GDN_STREAM`, `GDEC_GDN_WAVE`, `GDEC_GDN_FUSED`, `GDEC_GEMM_WMMA`, `GDEC_INDEX_FUSED2`, `GDEC_INDEX_STREAM_SELECT`, `GDEC_PP_MOE_OUT`).
+
+Diagnostics: `GDEC_PHASE=3` prints named sub-layer prefill times per chunk and `GDEC_PERF=1` prints decode time per token by phase; both synchronise the stream and are never throughput measurements. Mechanisms, measurements and the quality-gate results are in the parent's [`variant-flash/TECHNIQUES.md`](../../../variant-flash/TECHNIQUES.md).
 
 ## Runtime boundaries
 

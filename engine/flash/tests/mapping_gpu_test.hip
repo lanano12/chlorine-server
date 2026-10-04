@@ -33,7 +33,7 @@ int main() {
     Buffer<block_q6_K> dw(w);WView view{12,(uint8_t*)dw.p,R,K,0};
     std::vector<float> decoded(R*K);dequantize_row_q6_K(w.data(),decoded.data(),R*K);
     Buffer<float> values(R*K);q6_values<<<(R*K+255)/256,256>>>(view.data,values.p,R*K);
-    Compare bytes,head,identity;auto v=values.get();for(size_t i=0;i<v.size();i++)bytes.check(v[i],decoded[i],true);
+    Compare bytes,head,identity,kernels;auto v=values.get();for(size_t i=0;i<v.size();i++)bytes.check(v[i],decoded[i],true);
     for(int P:{1,2,8,17,65})for(bool bf:{false,true}) {
       std::vector<float> x(P*S);std::vector<uint16_t> xb(P*S);
       for(size_t i=0;i<x.size();i++){float z=float(int(rng()%101)-50)/64.f;xb[i]=gguf_map::f2bf(z);uint32_t u=uint32_t(xb[i])<<16;memcpy(&x[i],&u,4);}
@@ -50,8 +50,18 @@ int main() {
       }
       Buffer<float> subset(7);gemv(view,dx.p,subset.p,3,7);auto sub=subset.get();
       for(int r=0;r<7;r++)identity.check(sub[r],single[3+r],true);
+      // The block-decoding head kernel must reproduce the per-element kernel exactly.
+      Buffer<float> scalar(P*R);
+      for(int base=0;base<P;base+=8) {
+        const int count=std::min(8,P-base);
+        if(bf)k_flash_q6_gemv_scalar<true><<<(R+7)/8,256>>>(view.data,db.p+base*S,scalar.p+base*R,R,K,count,S);
+        else k_flash_q6_gemv_scalar<false><<<(R+7)/8,256>>>(view.data,dx.p+base*S,scalar.p+base*R,R,K,count,S);
+      }
+      checked(hipGetLastError());auto old=scalar.get();
+      for(size_t i=0;i<old.size();i++)kernels.check(got[i],old[i],true);
     }
     bytes.print("q6_device_vs_ggml");head.print("q6_head_vs_double");identity.print("q6_batch_serial_row_offset");
+    kernels.print("q6_block_vs_scalar_kernel");
     Compare gates,gidentity;constexpr int H=48,P=65;
     std::vector<float> a(P*H),b(P*H),coef(H),alog(H),bias(H);
     const float boundary[]={-80.f,-20.f,-1.f,0.f,1.f,19.999f,20.f,20.001f,80.f};

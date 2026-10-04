@@ -18,6 +18,8 @@ inline nlohmann::ordered_json parse_capabilities(const std::string& line) {
       throw std::runtime_error("invalid CAPS capacity");
   for(const char* field:{"gpu_qualified","model_qualified","vision_qualified"})
     if(!j.at(field).is_boolean())throw std::runtime_error("invalid CAPS qualification");
+  if(j.contains("diagnostic_trace") && !j.at("diagnostic_trace").is_boolean())
+    throw std::runtime_error("invalid CAPS diagnostic mode");
   return j;
 }
 }

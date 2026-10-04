@@ -8,6 +8,7 @@ struct KvOverflow : std::runtime_error {
 
 struct GpuModel {
   const Checkpoint& ckpt;
+  chlorine_flash::Trace trace = chlorine_flash::Trace::from_environment();
   bool ple_on = true;
   int maxctx;
   int maxbatch;  // prefill chunk size: batch buffers are allocated at
@@ -422,10 +423,16 @@ struct GpuModel {
   }();
 
   explicit GpuModel(const Checkpoint& c, int mc) : ckpt(c), maxctx(mc) {
-    // F32 GGUF projections consume float residuals. GR_BF16 changes their
-    // representation, so reject it until a separately qualified path exists.
-    if (g_gguf && gr_bf16)
-      throw std::runtime_error("Flash GGUF F32 mapping requires GDEC_GR_BF16 unset");
+    // F32 GGUF projections consume float residuals. GR_BF16 stores the batched
+    // residual stream in bf16, which the FP32 SGEMM route cannot read; it is only
+    // allowed together with GDEC_F32_GEMM_BF16, where bf16-exact F32 matrices take
+    // the bf16 GEMM paths. That combination is a separate arithmetic mode and
+    // needs its own quality gate.
+    if (g_gguf && gr_bf16 && !f32_gemm_bf16)
+      throw std::runtime_error("Flash GGUF F32 mapping requires GDEC_GR_BF16 unset "
+                               "(or GDEC_F32_GEMM_BF16=1)");
+    if (trace.active() && (gr_bf16 || !qsa_kv_fp32))
+      throw std::runtime_error("Flash trace currently requires FP32 residual and KV storage");
     // Prefill workspace is sized by maxbatch, NOT maxctx: long prompts are
     // processed in maxbatch-token chunks via the same continuation path as
     // KV reuse, so a 256K context costs chunk-sized workspace (~4.5 GB at
@@ -1478,12 +1485,18 @@ struct GpuModel {
     }
     const size_t n4 = (size_t)P * d / 4;
     k_f32_to_f16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(x, x16, n4);
+    const bool sp = P > 1;  // sub-layer timers cover batched prefill only
+    if (sp) sp_mark("moe.route");
     if (!flash_moe_up(g.tgu, g.gate, g.up, x16, tokidx, tiles, ntiles, max_tiles, hid, mid, d,
-                   g_str) ||
-        !flash_moe_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str))
+                   g_str))
       throw std::runtime_error("moe_gguf: unsupported expert type");
+    if (sp) sp_mark("moe.up");
+    if (!flash_moe_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str))
+      throw std::runtime_error("moe_gguf: unsupported expert type");
+    if (sp) sp_mark("moe.down");
     k_moe_reduce_pw<10><<<dim3((d + 255) / 256, P), 256, 0, g_str>>>(pairs, pairids, pw, acc,
                                                                      P, d);
+    if (sp) sp_mark("moe.reduce");
   }
 
   // hgn q4cp routed experts through the LUT-decode WMMA kernels (GDEC_MOE_Q4W):
@@ -1739,6 +1752,39 @@ struct GpuModel {
   bool prof = getenv("GDEC_PROF") != nullptr;  // host-side phase timing
   double p_topk_wait = 0, p_bucket = 0, p_gemm = 0, p_pleh = 0,
          p_ple_wait = 0;
+  // Chlorine: GDEC_PHASE=3 adds synchronizing sub-layer timers to batched prefill.
+  // Diagnostic only: every mark waits for the stream, so the totals exceed an
+  // unprofiled run and no timing from this mode is a throughput measurement.
+  // sp_mark(name) charges the time since the previous mark to `name`.
+  struct SubProf {
+    bool on = getenv("GDEC_PHASE") != nullptr && getenv("GDEC_PHASE")[0] == '3';
+    std::vector<std::pair<const char*, double>> acc;  // first-seen order
+    std::chrono::steady_clock::time_point t;
+  } subprof;
+  void sp_begin() {
+    if (!subprof.on) return;
+    CK(hipStreamSynchronize(g_str));
+    subprof.t = std::chrono::steady_clock::now();
+  }
+  void sp_mark(const char* name) {
+    if (!subprof.on) return;
+    CK(hipStreamSynchronize(g_str));
+    auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - subprof.t).count();
+    subprof.t = now;
+    for (auto& a : subprof.acc)
+      if (!strcmp(a.first, name)) { a.second += ms; return; }
+    subprof.acc.emplace_back(name, ms);
+  }
+  void sp_report() {
+    if (!subprof.on) return;
+    double total = 0;
+    for (auto& a : subprof.acc) total += a.second;
+    fprintf(stderr, "subphase");
+    for (auto& a : subprof.acc) fprintf(stderr, " %s=%.1f", a.first, a.second);
+    fprintf(stderr, " total=%.1f ms\n", total);
+    subprof.acc.clear();
+  }
   // perf accumulators (ms): embed, ple, attn, moe, head
   double t_acc[5] = {0, 0, 0, 0, 0};
   double t_enq = 0, t_sync = 0;
@@ -1770,6 +1816,24 @@ struct GpuModel {
     k_repeat4<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_emb, d_R, g_cfg.d);
     h_rms("gpu", -1, "emb", d_emb, g_cfg.d);
   }
+  // Readbacks are only enabled in diagnostic mode, on selected rows/layers.
+  // Order reads on the same stream; never copy a T x hidden/vocabulary matrix.
+  void trace_row(const char* phase, const char* stage, int layer, int p,
+                 const float* device, size_t count) {
+    if (!trace.wants(layer, p)) return;
+    std::vector<float> host(count);
+    CK(hipMemcpyAsync(host.data(), device, count * sizeof(float),
+                      hipMemcpyDeviceToHost, g_str));
+    CK(hipStreamSynchronize(g_str));
+    trace.write(phase, stage, layer, p, host);
+  }
+  void trace_rows(const char* stage, int layer, int base, int P,
+                  const float* device, size_t width) {
+    if (!trace.active()) return;
+    for (int p : trace.positions())
+      if (p >= base && p < base + P)
+        trace_row("prefill", stage, layer, p, device + size_t(p-base)*width, width);
+  }
   void enq_layer(int l) {
     char prefix[128];
     snprintf(prefix, sizeof prefix, "layers.%d.attn_hyper_connection", l);
@@ -1779,6 +1843,10 @@ struct GpuModel {
       qsa(l, l / 4, d_x, d_y);
     else
       gdn(l, l - (l + 1) / 4, d_x, d_y);
+    trace_row("decode", "attn-input", l, pos, d_x, 2560);
+    trace_row("decode", "attn-output", l, pos, d_y, 2560);
+    if (!is_qsa(l)) trace_row("decode", "gdn-state-head0", l, pos,
+        d_S + size_t(l-(l+1)/4)*48*128*128, 128*128);
     h_rms("gpu", l, "attn-x", d_x, 2560);
     h_rms("gpu", l, "attn-y", d_y, 2560);
     gr_write(prefix, d_y);
@@ -1787,14 +1855,18 @@ struct GpuModel {
     auto t3 = tick();
     gr_read(prefix, d_x);
     moe(l, d_x, d_y);
+    trace_row("decode", "mlp-input", l, pos, d_x, 2560);
+    trace_row("decode", "mlp-output", l, pos, d_y, 2560);
     h_rms("gpu", l, "mlp-x", d_x, 2560);
     h_rms("gpu", l, "mlp-y", d_y, 2560);
     gr_write(prefix, d_y);
     tock(3, t3);
   }
-  void enq_final() {
+  void enq_final(int trace_pos = -1, const char* trace_phase = "decode") {
     gr_read("hyper_connection_mixer", d_x /*h*/);
+    trace_row(trace_phase, "head-input", -1, trace_pos, d_x, 2560);
     gemv(wview(ckpt.at("lm_head.weight")), d_x, d_logits);
+    trace_row(trace_phase, "logits", -1, trace_pos, d_logits, g_cfg.vocab);
     argmax_rows(d_logits, g_cfg.vocab, 1, d_amx_cand, d_argmax, g_str);
   }
 
@@ -1804,11 +1876,53 @@ struct GpuModel {
   // A = W (transa=T, lda=K), B = X (transb=N, ldb=K), C = Y (ldc=N).
   // W -> bf16 for the LT / WMMA paths: dense bf16 is used in place, the
   // quantized dtypes dequant into the shared d_wbf16 scratch (<= 64 MiB).
+  // Chlorine: GDEC_F32_GEMM_BF16=1 sends batched (P > 8) GEMMs on F32 GGUF matrices
+  // (expert router, HC inject, GDN a/b gates, shared-expert gate) through the bf16
+  // paths that every other prefill GEMM already uses, instead of rocBLAS SGEMM.
+  // Only a matrix whose values are all exact in bf16 qualifies, so the weights
+  // lose nothing; the activations are rounded to bf16 as for the quantized
+  // matrices. P <= 8 (decode, speculative verify) keeps FP32 SGEMM. Opt-in: this
+  // changes prefill arithmetic and needs its own quality gate.
+  bool f32_gemm_bf16 = getenv("GDEC_F32_GEMM_BF16") != nullptr;
+  std::unordered_map<const uint8_t*, uint16_t*> f32_bf16_cache_;
+  const uint16_t* f32_exact_bf16(const WView& w) {
+    auto it = f32_bf16_cache_.find(w.data);
+    if (it != f32_bf16_cache_.end()) return it->second;
+    const size_t n = (size_t)w.rows * w.cols;
+    uint16_t* dst = nullptr;
+    unsigned* count = nullptr;
+    CK(hipMalloc(&dst, n * 2));
+    CK(hipMalloc(&count, 4));
+    CK(hipMemsetAsync(count, 0, 4, g_str));
+    k_flash_f32_to_bf16_exact<<<(unsigned)((n + 255) / 256), 256, 0, g_str>>>(
+        (const float*)w.data, dst, n, count);
+    CK(hipStreamSynchronize(g_str));
+    unsigned inexact = 0;
+    CK(hipMemcpy(&inexact, count, 4, hipMemcpyDeviceToHost));
+    CK(hipFree(count));
+    if (inexact) {
+      CK(hipFree(dst));
+      dst = nullptr;
+      fprintf(stderr, "f32 gemm: %llux%llu matrix has %u values inexact in bf16; stays FP32\n",
+              (unsigned long long)w.rows, (unsigned long long)w.cols, inexact);
+    }
+    static bool said = false;
+    if (dst && !said) {
+      said = true;
+      fprintf(stderr, "f32 gemm: bf16-exact F32 matrices use the bf16 GEMM paths at P > 8 "
+                      "(GDEC_F32_GEMM_BF16)\n");
+    }
+    return f32_bf16_cache_[w.data] = dst;
+  }
+
   const uint16_t* gemm_wbf16(const WView& w) {
     uint64_t N = w.rows, K = w.cols;
     const uint16_t* wp = nullptr;
     if (w.dtype == 0) {
       wp = (const uint16_t*)w.data;
+    } else if (w.dtype == 1) {
+      wp = f32_exact_bf16(w);
+      if (!wp) throw std::runtime_error("gemm: F32 matrix is not exact in bf16");
     } else if (w.dtype == 5) {
       if (N * K * 2 > ((size_t)64 << 20))
         throw std::runtime_error("gemm: weight too big for d_wbf16");
@@ -1839,6 +1953,23 @@ struct GpuModel {
 
   void gemm(const WView& w, const float* x, float* y, int P, uint64_t xstride = 0,
             const uint16_t* xbf = nullptr) {
+    // bf16-exact F32 matrix on the batched bf16 route: continue as dense bf16.
+    // With a bf16 residual stream (gr_bf16) every batch size takes it, because
+    // the FP32 input an SGEMM would need is not maintained in that mode.
+    if (w.dtype == 1 && f32_gemm_bf16 && (P > 8 || gr_bf16)) {
+      if (const uint16_t* exact = f32_exact_bf16(w)) {
+        WView dense = w;
+        dense.dtype = 0;
+        dense.data = (uint8_t*)exact;
+        gemm_any(dense, x, y, P, xstride, xbf);
+        return;
+      }
+      if (gr_bf16) throw std::runtime_error("gemm: F32 matrix is not exact in bf16 (GR_BF16)");
+    }
+    gemm_any(w, x, y, P, xstride, xbf);
+  }
+  void gemm_any(const WView& w, const float* x, float* y, int P, uint64_t xstride,
+                const uint16_t* xbf) {
     auto pt0 = std::chrono::steady_clock::now();
     uint64_t N = w.rows, K = w.cols;
     if (!xstride) xstride = K;
@@ -1851,7 +1982,8 @@ struct GpuModel {
       if(prof)p_gemm+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-pt0).count();
       return;
     }
-    // Preserve GGUF FP32 router/gate matrices and FP32 activations.
+    // Preserve GGUF FP32 router/gate matrices and FP32 activations (the bf16-exact
+    // batched route was diverted by gemm() before reaching here).
     if(w.dtype == 1) {
       if (!x) throw std::runtime_error("flash f32 gemm requires float input");
       float one=1.f, zero=0.f;
@@ -2173,6 +2305,7 @@ struct GpuModel {
     gemm(wview(ckpt.at(buf)), d_Rhatb, d_t320b, P, 0,
          gr_bf16 ? d_Rhatbf16 : nullptr);
     k_silu_scale<<<(P * 320 + 255) / 256, 256, 0, g_str>>>(d_t320b, 0.25f, P * 320);
+    if (P > 1) sp_mark("hc.mix_down");
     snprintf(buf, sizeof buf, "%s.input_mix_weight_up.weight", prefix.c_str());
     const WView wup = wview(ckpt.at(buf));
     if (prefill_fused && gr_bf16 && hc_up_fused(wup, P)) {
@@ -2182,6 +2315,7 @@ struct GpuModel {
       return;
     }
     gemm(wup, d_t320b, d_Gb, P);
+    if (P > 1) sp_mark("hc.mix_up");
     if (prefill_fused) {
       if (gr_bf16) {
         // verify sizes: 4 column slices over P*4 blocks (per-column arithmetic
@@ -2198,6 +2332,7 @@ struct GpuModel {
       } else
         k_gr_combine_b<true><<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
             d_Gb, d_Rhatb, d_xb, g_cfg.d, g_cfg.branches, P, d_xbf16);
+      if (P > 1) sp_mark("hc.combine");
       xf16_src = d_xb;
       xf16_xs = xf16_K = g_cfg.d;
       xf16_P = P;
@@ -2222,6 +2357,7 @@ struct GpuModel {
           d_Rb, hw, d_Rhatb, 2560, g_cfg.norm_eps, 4);
     if (xf16_src == d_Rhatb) xf16_src = nullptr;  // d_Rhatb overwritten
     injp_cur = -1;  // new Rhat without inject partials
+    if (P > 1) sp_mark("hc.norm");
     gr_mix_b(prefix, P);
   }
 
@@ -2271,12 +2407,14 @@ struct GpuModel {
       gemm(wview(ckpt.at(buf)), d_Rhatb, d_w4b, P, 0,
            gr_bf16 ? d_Rhatbf16 : nullptr);
     }
+    if (P > 1) sp_mark("hc.inject");
     if (gr_bf16)
       k_gr_write_b_hc_bf16<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
           d_w4b, (uint16_t*)d_Rb, d_yb, g_cfg.d, g_cfg.branches, P);
     else
       k_gr_write_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
           d_w4b, d_Rb, d_yb, g_cfg.d, g_cfg.branches, P);
+    if (P > 1) sp_mark("hc.write");
   }
 
   void gr_write_read_b(const std::string& write_prefix,
@@ -2332,6 +2470,7 @@ struct GpuModel {
           g_cfg.norm_eps);
     if (!wn) injp_cur = -1;
     if (xf16_src == d_Rhatb) xf16_src = nullptr;
+    if (P > 1) sp_mark("hc.scatter_norm");
     gr_mix_b(read_prefix, P);
   }
 
@@ -2348,6 +2487,7 @@ struct GpuModel {
     gemm(wview(ckpt.at(buf)), d_xb, d_beta48b, P);
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_z.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_zb, P);
+    sp_mark("gdn.proj");
     float* convst = d_convst + (size_t)gi * 3 * 10240;
     const float* cw = d_convw + (size_t)gi * 10240 * 4;
     const float* Alog = d_Alog + (size_t)gi * 48;
@@ -2462,6 +2602,7 @@ struct GpuModel {
       k_gdn_gatednorm_b<true><<<dim3(48, (P + 31) / 32), 128, 0, g_str>>>(
           d_convb + 4096, d_zb, gnw, nullptr, g_cfg.norm_eps, 10240, 6144,
           d_xbf16b, P);
+      sp_mark("gdn.scan");
       snprintf(buf, sizeof buf, "layers.%d.linear_attn.out_proj.weight", l);
       gemm(wview(ckpt.at(buf)), d_convb + 4096, d_yb, P, 10240 /*row stride*/,
            d_xbf16b);
@@ -3042,12 +3183,14 @@ struct GpuModel {
         first = nxt;
       }
     }
+    sp_mark("qsa.index");
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_qgb, P);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_kbb, P);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.v_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_xb, d_vbb, P);
+    sp_mark("qsa.proj");
     snprintf(buf, sizeof buf, "layers.%d.self_attn.q_norm.weight", l);
     float* qnw = ensure_norm256(buf);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_norm.weight", l);
@@ -3198,6 +3341,7 @@ struct GpuModel {
         k_sigmoid_gate<<<(6144 + 255) / 256, 256, 0, g_str>>>(att, gs, att, 6144);
       }
     }
+    sp_mark("qsa.attn");
     snprintf(buf, sizeof buf, "layers.%d.self_attn.o_proj.weight", l);
     gemm(wview(ckpt.at(buf)), d_attnb, d_yb, P, 0, attn_bf);
   }
@@ -3259,8 +3403,10 @@ struct GpuModel {
       fflush(moe_dump);
     }
     if (gg_on()) {
+      sp_mark("moe.router");
       moe_gguf(g_ggx.at(l), d_xb, d_topidsb, d_topwb, acc, P);
       moe_b_shared(l, P, acc, direct_output);
+      sp_mark("moe.shared");
       return;
     }
     snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
@@ -3808,6 +3954,7 @@ struct GpuModel {
     char attn_prefix[128], mlp_prefix[128];
     snprintf(attn_prefix, sizeof attn_prefix,
              "layers.%d.attn_hyper_connection", l);
+    sp_begin();
     if (fuse_prev_mlp) {
       snprintf(mlp_prefix, sizeof mlp_prefix,
                "layers.%d.mlp_hyper_connection", l - 1);
@@ -3815,10 +3962,16 @@ struct GpuModel {
     } else {
       gr_read_b(attn_prefix, P);
     }
+    sp_mark("hc.rest");
     if (is_qsa(l))
       qsa_b(l, l / 4, P, base);
     else
       gdn_b(l, l - (l + 1) / 4, P);
+    sp_mark(is_qsa(l) ? "qsa.rest" : "gdn.rest");
+    trace_rows("attn-input", l, base, P, d_xb, 2560);
+    trace_rows("attn-output", l, base, P, d_yb, 2560);
+    if (!is_qsa(l)) trace_row("prefill", "gdn-state-head0", l, base+P-1,
+        d_S + size_t(l-(l+1)/4)*48*128*128, 128*128);
     if (dbg) {
       h_rms("gpu", l, "attn-x", d_xb + (size_t)(P - 1) * 2560, 2560);
       h_rms("gpu", l, "attn-y", d_yb + (size_t)(P - 1) * 2560, 2560);
@@ -3831,12 +3984,16 @@ struct GpuModel {
       gr_write_b(attn_prefix, P);
       gr_read_b(mlp_prefix, P);
     }
+    sp_mark("hc.rest");
     moe_b(l, P);
+    trace_rows("mlp-input", l, base, P, d_xb, 2560);
+    trace_rows("mlp-output", l, base, P, d_yb, 2560);
     if (dbg) {
       h_rms("gpu", l, "mlp-x", d_xb + (size_t)(P - 1) * 2560, 2560);
       h_rms("gpu", l, "mlp-y", d_yb + (size_t)(P - 1) * 2560, 2560);
     }
     if (flush_mlp) gr_write_b(mlp_prefix, P);
+    sp_mark("hc.rest");
     if (!dbg && isatty(2)) {  // per-layer \r is terminal-only; logs use prefill-live
       fprintf(stderr, "\rprefill L%02d/%d", l + 1, g_cfg.layers);
       fflush(stderr);
@@ -4113,6 +4270,7 @@ struct GpuModel {
               d_img_emb, d_img_inj, d_Rb);
       }
     }
+    trace_rows("embedding-residual", -1, base, P, d_Rb, 10240);
     enq_layer_b(0, P, false, true, base);
     if (prog_total > 0) prog_probe(0, P);
     phase("embed+L0", TP);
@@ -4154,6 +4312,7 @@ struct GpuModel {
         d_Rb = hc_storage;
       }
     }
+    trace_rows("ple-residual", -1, base, P, d_Rb, 10240);
     phase("ple", TP);
     if (ws_ok_) CK(hipEventRecord(conc_ev_a_, g_str));  // D1b quantum clock
     for (int l = 1; l < g_cfg.layers; l++) {
@@ -4168,6 +4327,21 @@ struct GpuModel {
         snprintf(lbuf, sizeof lbuf, "L%02d", l);
         phase(lbuf, TP);
       }
+    }
+    trace_rows("final-residual", -1, base, P, d_Rb, 10240);
+    // Diagnostic readout of selected non-final rows uses the production
+    // one-row mixer/head with the existing scratch. No recurrent/KV/PLE
+    // state is changed, and the normal final row overwrites logits/argmax.
+    if (trace.active()) {
+      float* saved_R = d_R;
+      try {
+        for (int p : trace.positions()) if (p >= base && p < base + P &&
+                                             (!final || p != base + P - 1)) {
+          d_R = d_Rb + size_t(p-base)*10240;
+          enq_final(p, "prefill");
+        }
+      } catch (...) { d_R = saved_R; throw; }
+      d_R = saved_R;
     }
     phase("L25-47", TP);
     // MTP tap capture: d_Rb now holds the final 48-layer stream for every row.
@@ -4202,7 +4376,7 @@ struct GpuModel {
     CK(hipMemcpyAsync(d_ringpos, &ple_ringpos, 4, hipMemcpyHostToDevice, g_str));
     // Verify consumes batch logits; do not compute and synchronously read
     // the last row's lm_head a second time.
-    if (final) enq_final();
+    if (final) enq_final(base + P - 1, "prefill");
     phase("final", TP);
     int id = -1;
     if (final && prog_total > 0) prog_wait(P);
@@ -4222,6 +4396,7 @@ struct GpuModel {
               "prof: gemm_host=%.0fms topk_wait=%.0fms bucket+h2d=%.0fms "
               "ple_host=%.0fms ple_wait=%.0fms\n",
               p_gemm, p_topk_wait, p_bucket, p_pleh, p_ple_wait);
+    sp_report();
 #ifdef GDEC_PHASE_PROF
     if (getenv("GDEC_PHASE_PROF")) {
       CK(hipStreamSynchronize(g_str));
@@ -6660,7 +6835,7 @@ struct GpuModel {
   hipGraphExec_t g1_exec = nullptr, g2_exec = nullptr;
   bool graphs_ok = false;
   void build_graphs() {
-    if (dbg || perf || getenv("GDEC_NOGRAPH")) return;
+    if (dbg || perf || trace.active() || getenv("GDEC_NOGRAPH")) return;
     // pre-populate lazy caches (hipMalloc/hipMemcpy are illegal during capture)
     for (int l = 0; l < g_cfg.layers; l++) {
       char p[128];
@@ -7023,6 +7198,7 @@ struct GpuModel {
   // process (the constructor memsets d_S/d_convst; hipMalloc's fresh zero
   // pages cover d_ring — reproduce both here).
   void reset_state() {
+    trace.new_request();
     pos = 0;
     ple_ringpos = 0;
     chist.clear();
@@ -7079,6 +7255,7 @@ struct GpuModel {
     CK(hipMemcpyAsync(d_ringpos, &ple_ringpos, 4, hipMemcpyHostToDevice, g_str));
     auto T0 = tick();
     enq_embed();
+    trace_row("decode", "embedding-residual", -1, pos, d_R, 10240);
     tock(0, T0);
     // layer 0 enqueued first so PLE host reads overlap with GPU work
     enq_layer(0);
@@ -7090,10 +7267,12 @@ struct GpuModel {
       ple_gpu();
       ple_ringpos = (ple_ringpos + 1) % chlorine_flash::ple_ring_slots;
     }
+    trace_row("decode", "ple-residual", -1, pos, d_R, 10240);
     for (int l = 1; l < g_cfg.layers; l++) enq_layer(l);
+    trace_row("decode", "final-residual", -1, pos, d_R, 10240);
     auto t4 = tick();
     auto enq0 = std::chrono::steady_clock::now();
-    enq_final();
+    enq_final(pos);
     pos++;
     int id;
     double enq_ms =
@@ -7113,6 +7292,7 @@ struct GpuModel {
     }
     tock(4, t4);
     t_n++;
+    if (perf && t_n % 64 == 0) perf_report();  // serve mode never reaches the exit report
     return id;
   }
 

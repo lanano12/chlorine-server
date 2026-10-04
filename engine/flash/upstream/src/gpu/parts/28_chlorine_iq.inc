@@ -1,5 +1,6 @@
 // Chlorine Flash additions. Retains upstream routing and ordered reduction.
-// IQ3_S prefill: decode only a 128x16 weight tile, never a full expert plane.
+// IQ3_S prefill, original kernel: decode only a 128x16 weight tile, never a full expert plane.
+// Superseded by k_moe_lut<kIQ3S> (27_kernels_moe_lut.inc); kept as the bit-identity reference.
 // FP16 operand rounding and FP32 WMMA accumulation require the GPU quality gate.
 __launch_bounds__(256) __global__
 void k_flash_iq3_up(const uint8_t* gate,const uint8_t* up,const __half* x,
@@ -54,6 +55,10 @@ static bool flash_moe_up(int type,const uint8_t* gate,const uint8_t* up,const __
   const int* tokidx,const MoeTile* tiles,const int* ntiles,int max_tiles,__half* hid,int m,int k,hipStream_t st) {
   if(type==21) {
     if(k%256 || m%64) return false;
+    // LUT-staged kernel by default; GDEC_FLASH_IQ3_SCALAR=1 keeps the original
+    // per-element kernel. Their outputs are bit-identical (moe_test checks it).
+    static const bool scalar=getenv("GDEC_FLASH_IQ3_SCALAR")!=nullptr;
+    if(!scalar) return moe_lut_up(21,flash_iq_weights(gate,up,m),x,tokidx,tiles,ntiles,max_tiles,hid,m,k,st);
     k_flash_iq3_up<<<dim3((m+63)/64,max_tiles),256,0,st>>>(gate,up,x,tokidx,tiles,ntiles,hid,m,k);
     return true;
   }
@@ -87,10 +92,22 @@ static bool flash_moe_gemv(int gu,int dn,const uint8_t* gate,const uint8_t* up,
   return true;
 }
 // F32 matrices remain F32 in the GGUF mapping (routers, HC injection, GDN gates).
+// GDEC_F32_GEMM_BF16: batched GEMMs may read such a matrix as bf16 when every value
+// is exact in bf16 (the model's native weight type). This copies the high halves
+// and counts any value that would lose bits; one inexact value keeps the F32 path.
+__global__ void k_flash_f32_to_bf16_exact(const float* w,uint16_t* out,size_t n,unsigned* inexact) {
+  const size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=n)return;
+  const uint32_t bits=__builtin_bit_cast(uint32_t,w[i]);
+  out[i]=uint16_t(bits>>16);
+  if(bits&0xFFFFu)atomicAdd(inexact,1u);
+}
 // Q6_K vocabulary head. One wave per output row; share decoded weights across
 // up to eight inputs. P=1 and multi-row use the same accumulation/reduction order.
+// Original head kernel: one flash_quant::value call per element. Kept as the
+// bit-identity reference for k_flash_q6_gemv (mapping_gpu_test compares them).
 template<bool XBf16=false>
-__global__ void k_flash_q6_gemv(const uint8_t* w,const void* x,float* out,
+__global__ void k_flash_q6_gemv_scalar(const uint8_t* w,const void* x,float* out,
                               int rows,int cols,int P,size_t xs) {
   const int lane=threadIdx.x%32,r=blockIdx.x*8+threadIdx.x/32;
   if(r>=rows)return;
@@ -102,6 +119,48 @@ __global__ void k_flash_q6_gemv(const uint8_t* w,const void* x,float* out,
       const float xv=XBf16 ? __uint_as_float(unsigned(((const uint16_t*)x)[t*xs+c])<<16)
                           : ((const float*)x)[t*xs+c];
       sum[t]+=weight*xv;
+    }
+  }
+  for(int t=0;t<P;t++) {
+    float v=sum[t];
+    for(int offset=16;offset;offset>>=1)v+=__shfl_down(v,offset,32);
+    if(lane==0)out[(size_t)t*rows+r]=v;
+  }
+}
+// A lane owns the elements whose in-group index equals its lane id, so per
+// (block, half) it needs two low-nibble bytes, one high-bit byte, eight scale
+// bytes and the block's d. Reading those once replaces five byte loads and one
+// half conversion per element; the element order and FP32 expressions are the
+// scalar kernel's, so the sums are bit-identical.
+template<bool XBf16=false>
+__global__ void k_flash_q6_gemv(const uint8_t* w,const void* x,float* out,
+                              int rows,int cols,int P,size_t xs) {
+  const int lane=threadIdx.x%32,r=blockIdx.x*8+threadIdx.x/32;
+  if(r>=rows)return;
+  const int blocks=cols/256;
+  const uint8_t* row=w+(size_t)r*blocks*210;
+  float sum[8]={};
+  for(int blk=0;blk<blocks;++blk) {
+    const uint8_t* b=row+(size_t)blk*210;
+    const float d=flash_quant::half_value(flash_quant::u16(b+208));
+#pragma unroll
+    for(int half=0;half<2;++half) {
+      const unsigned q0=b[half*64+lane],q1=b[half*64+32+lane],qh=b[128+half*32+lane];
+      uint64_t sc;
+      __builtin_memcpy(&sc,b+192+half*8,8);
+#pragma unroll
+      for(int group=0;group<4;++group) {
+        const unsigned low=group%2 ? q1 : q0;
+        const unsigned code=((low>>(group>=2?4:0))&15) | (((qh>>(group*2))&3)<<4);
+        const int scale=int(int8_t((sc>>(8*(group*2+lane/16)))&255));
+        const float weight=(d*float(scale))*float(int(code)-32);
+        const int c=blk*256+half*128+group*32+lane;
+        for(int t=0;t<P;t++) {
+          const float xv=XBf16 ? __uint_as_float(unsigned(((const uint16_t*)x)[t*xs+c])<<16)
+                              : ((const float*)x)[t*xs+c];
+          sum[t]+=weight*xv;
+        }
+      }
     }
   }
   for(int t=0;t<P;t++) {

@@ -19,6 +19,15 @@ template<class T> T* copy(const std::vector<T>& h) {
 __global__ void decode_values(int type,const uint8_t* bytes,float* out,int count) {
  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<count)out[i]=flash_quant::value(type,bytes,i);
 }
+// Block unit loaders against the per-element reference loader, bit for bit.
+template<int T> __global__ void unit_check(const uint8_t* rows,int count,size_t row_bytes,int units,unsigned* mismatches) {
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=count)return;
+ moegg::UnitW<T> fast;moegg::IqUnitW<T> reference;
+ fast.load(rows+(size_t)(i/units)*row_bytes,i%units);reference.load(rows+(size_t)(i/units)*row_bytes,i%units);
+ unsigned bad=fast.off!=reference.off;
+ for(int k=0;k<32;++k)bad+=__builtin_bit_cast(uint32_t,fast.w[k])!=__builtin_bit_cast(uint32_t,reference.w[k]);
+ if(bad)atomicAdd(mismatches,bad);
+}
 int main() {
  int devices=0;if(hipGetDeviceCount(&devices)!=hipSuccess || !devices){fprintf(stderr,"SKIP: HIP device unavailable\n");return 77;}
  constexpr int E=10,D=256,M=64,P=8;
@@ -65,6 +74,16 @@ int main() {
    }
   }
   failures+=diff!=0;
+  if(dn==20) {
+   const int units=D/32,count=E*M*units;std::vector<unsigned> zero(1,0);auto* bad=copy(zero);
+   const size_t rb=gguf::row_bytes(gu,D);
+   if(gu==21)unit_check<21><<<(count+255)/256,256>>>(dg,count,rb,units,bad);
+   else if(gu==20)unit_check<20><<<(count+255)/256,256>>>(dg,count,rb,units,bad);
+   else unit_check<23><<<(count+255)/256,256>>>(dg,count,rb,units,bad);
+   H(hipGetLastError());H(hipMemcpy(zero.data(),bad,4,hipMemcpyDeviceToHost));H(hipFree(bad));
+   printf("type %d block unit loader vs per-element loader: %u mismatches / %d values\n",gu,zero[0],count*32);
+   failures+=zero[0]!=0;
+  }
   // Host and device packed decoders must return exactly the same FP32 bits.
   decode_values<<<1,256>>>(gu,dg,out,D);
   H(hipMemcpy(serial.data(),out,D*4,hipMemcpyDeviceToHost));

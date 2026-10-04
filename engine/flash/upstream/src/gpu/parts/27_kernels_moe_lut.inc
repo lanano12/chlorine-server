@@ -16,12 +16,20 @@
 // Numerics: w = f16(f16(lut) * f16(scale)), F32 accumulate — like the GGUF path
 // (IQ: lut / 256 and scale * 256, exact rescale keeping scales out of fp16 subnormals).
 //
+// Chlorine addition, GGUF IQ3_S (110 B / 256: fp16 d, qs[64], qh[8], signs[32],
+//   scales[4]): gate/up only. A 32-element sub-block stages its 8 grid bytes, 8
+//   high bits, 32 sign bits and FP32 scale d * (1 + 2 * s); decode = 8 lookups in
+//   an LDS table of the 512 grid rows as FP32 magnitudes, then
+//   w = f16(scale * magnitude) with the sign bit applied. That is the scalar
+//   flash_quant::value expression, so the fragments, the per-16-column WMMA
+//   order and the epilogue reproduce k_flash_iq3_up bit for bit.
+//
 //   kPair (gate/up): hid F16 [slot][m] = up * silu(gate), grid = (m / 64, tiles)
 //   !kPair (down):   pairs F32 [slot][m],                grid = (m / 128, tiles)
 
 namespace moelut {
 
-constexpr int kQ4CP = 100, kIQ4NL = 20, kIQ4XS = 23;  // IQ: gguf::Type values
+constexpr int kQ4CP = 100, kIQ4NL = 20, kIQ4XS = 23, kIQ3S = 21;  // IQ: gguf::Type values
 
 __constant__ int8_t c_iq4_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
                                         1, 13, 25, 38, 53, 69, 89, 113};
@@ -41,7 +49,7 @@ struct LutW {
 
 template <int T>
 __host__ __device__ constexpr size_t lut_row_bytes(size_t k) {
-  return T == kQ4CP ? k / 2 : T == kIQ4NL ? (k / 32) * 18 : (k / 256) * 136;
+  return T == kQ4CP ? k / 2 : T == kIQ4NL ? (k / 32) * 18 : T == kIQ3S ? (k / 256) * 110 : (k / 256) * 136;
 }
 
 // IQ block codes (qs[0..15]: low nibbles = elements 0..15, high = 16..31)
@@ -73,7 +81,8 @@ __launch_bounds__(256) __global__
   using namespace moelut;
   constexpr int BM = 128, BK = 2;
   static_assert(BN % 16 == 0 && BN <= 64, "BN must match the MoeTile size (<= 64)");
-  static_assert(kLut == kQ4CP || kLut == kIQ4NL || kLut == kIQ4XS, "LUT type");
+  static_assert(kLut == kQ4CP || kLut == kIQ4NL || kLut == kIQ4XS || kLut == kIQ3S, "LUT type");
+  static_assert(kLut != kIQ3S || kPair, "IQ3_S is a gate/up format here");
   constexpr int kTokTiles = BN / 16;
   constexpr int kCodeBytes = BM * BK * 16;
   constexpr int kScaleBytes = BK * BM * 4;
@@ -83,13 +92,23 @@ __launch_bounds__(256) __global__
   constexpr int kLdsBytes = kStageBytes > 8 * 1024 ? kStageBytes : 8 * 1024;
   __shared__ __attribute__((aligned(16))) uint8_t lds[kLdsBytes];
   __shared__ uint32_t s_cbp[256];
+  __shared__ uint4 s_g3[kLut == kIQ3S ? 512 : 1];  // IQ3_S grid rows as 4 x FP32 magnitude
   auto* s_codes = reinterpret_cast<uint4*>(lds);
   auto* s_scale = reinterpret_cast<uint32_t*>(lds + kCodeBytes);
   auto* s_act = reinterpret_cast<uint4*>(lds + kCodeBytes + kScaleBytes);
 
   if ((int)blockIdx.y >= *ntiles) return;
   const int tid = threadIdx.x;
-  {
+  if constexpr (kLut == kIQ3S) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const uint32_t g = flash_quant::grid3(tid + i * 256);
+      s_g3[tid + i * 256] = make_uint4(__builtin_bit_cast(uint32_t, (float)(g & 255U)),
+                                       __builtin_bit_cast(uint32_t, (float)((g >> 8) & 255U)),
+                                       __builtin_bit_cast(uint32_t, (float)((g >> 16) & 255U)),
+                                       __builtin_bit_cast(uint32_t, (float)(g >> 24)));
+    }
+  } else {
     float lo, hi;
     if constexpr (kLut == kQ4CP) {
       lo = p.cb[tid & 15];
@@ -176,6 +195,17 @@ __launch_bounds__(256) __global__
         f_codes = make_uint4(__builtin_amdgcn_alignbyte(w1, w0, 2), __builtin_amdgcn_alignbyte(w2, w1, 2),
                              __builtin_amdgcn_alignbyte(w3, w2, 2), __builtin_amdgcn_alignbyte(w4, w3, 2));
       }
+    } else if constexpr (kLut == kIQ3S) {
+      // 110 B blocks are unaligned: memcpy keeps the loads byte-addressed.
+      const uint8_t* blk = f_ptr + (size_t)(kb / 8) * 110;
+      const int sub = kb % 8;
+      uint64_t qs;
+      uint32_t sg;
+      __builtin_memcpy(&qs, blk + 2 + sub * 8, 8);
+      __builtin_memcpy(&sg, blk + 74 + sub * 4, 4);
+      f_codes = make_uint4((uint32_t)qs, (uint32_t)(qs >> 32), sg, (uint32_t)blk[66 + sub]);
+      f_s = (uint32_t)blk[0] | ((uint32_t)blk[1] << 8) | ((uint32_t)blk[106 + sub / 2] << 16);
+      f_ib = sub;
     } else {
       const uint8_t* blk = f_ptr + (size_t)(kb / 8) * 136;
       const uint2 hdr = *reinterpret_cast<const uint2*>(blk);
@@ -194,8 +224,13 @@ __launch_bounds__(256) __global__
 
   const auto commit_stage = [&]() {
     const int row = tid >> 1;
-    uint32_t s16;
-    if constexpr (kLut == kQ4CP) {
+    uint32_t s16 = 0;
+    if constexpr (kLut == kIQ3S) {
+      s_codes[swizzle(row, f_c)] = f_codes;
+      const float db = flash_quant::half_value((uint16_t)(f_s & 0xFFFFU)) *
+                       (float)(1 + 2 * (int)((f_s >> (16 + 4 * (f_ib & 1))) & 15U));
+      s_scale[f_c * BM + row] = f_live ? __builtin_bit_cast(uint32_t, db) : 0U;
+    } else if constexpr (kLut == kQ4CP) {
       s_codes[swizzle(row, f_c)] = f_codes;
       s16 = f_s;
     } else {
@@ -212,7 +247,7 @@ __launch_bounds__(256) __global__
         s16 = __builtin_bit_cast(uint16_t, __float2half(d * (float)(ls - 32)));
       }
     }
-    s_scale[f_c * BM + row] = f_live ? (s16 | (s16 << 16)) : 0U;
+    if constexpr (kLut != kIQ3S) s_scale[f_c * BM + row] = f_live ? (s16 | (s16 << 16)) : 0U;
 #pragma unroll
     for (int i = 0; i < kActFetch; ++i)
       if (a_slot[i] >= 0) s_act[a_slot[i]] = a_data[i];
@@ -229,13 +264,30 @@ __launch_bounds__(256) __global__
     for (int c = 0; c < BK; ++c) raw[c] = s_codes[swizzle(row, c)];
 #pragma unroll
     for (int kb = 0; kb < BK; ++kb) {
-      const __half2 scale2 = __builtin_bit_cast(__half2, s_scale[kb * BM + row]);
-      const uint32_t words[4] = {raw[kb].x, raw[kb].y, raw[kb].z, raw[kb].w};
       __half2 h[16];
+      if constexpr (kLut == kIQ3S) {
+        const float db = __builtin_bit_cast(float, s_scale[kb * BM + row]);
+        const uint32_t qsw[2] = {raw[kb].x, raw[kb].y};
+        const uint32_t sg = raw[kb].z, qh = raw[kb].w;
+        const auto signed_w = [db](uint32_t mag, uint32_t neg) {
+          return __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, db * __builtin_bit_cast(float, mag)) ^ (neg << 31));
+        };
 #pragma unroll
-      for (int i = 0; i < 16; ++i) {
-        const uint32_t b = (words[i >> 2] >> (8 * (i & 3))) & 0xFFU;
-        h[i] = __hmul2(__builtin_bit_cast(__half2, s_cbp[b]), scale2);
+        for (int g = 0; g < 8; ++g) {
+          const uint32_t idx = ((qsw[g >> 2] >> (8 * (g & 3))) & 0xFFU) | (((qh >> g) & 1U) << 8);
+          const uint4 mg = s_g3[idx];
+          const uint32_t sb = sg >> (4 * g);
+          h[2 * g] = __floats2half2_rn(signed_w(mg.x, sb & 1U), signed_w(mg.y, (sb >> 1) & 1U));
+          h[2 * g + 1] = __floats2half2_rn(signed_w(mg.z, (sb >> 2) & 1U), signed_w(mg.w, (sb >> 3) & 1U));
+        }
+      } else {
+        const __half2 scale2 = __builtin_bit_cast(__half2, s_scale[kb * BM + row]);
+        const uint32_t words[4] = {raw[kb].x, raw[kb].y, raw[kb].z, raw[kb].w};
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+          const uint32_t b = (words[i >> 2] >> (8 * (i & 3))) & 0xFFU;
+          h[i] = __hmul2(__builtin_bit_cast(__half2, s_cbp[b]), scale2);
+        }
       }
       v16h a_lo, a_hi;
       __builtin_memcpy(&a_lo, &h[0], 32);
@@ -325,13 +377,14 @@ __launch_bounds__(256) __global__
 namespace moelut {
 static bool aligned(const void* ptr, uintptr_t a) { return ((uintptr_t)ptr & (a - 1)) == 0; }
 static bool lut_ok(int type, const LutW& p, bool pair, int k) {
-  if (k % (type == kIQ4XS ? 256 : 64)) return false;
-  const uintptr_t a = type == kQ4CP ? 16 : type == kIQ4NL ? 4 : 8;
+  if (type == kIQ3S && !pair) return false;
+  if (k % (type == kIQ4XS || type == kIQ3S ? 256 : 64)) return false;
+  const uintptr_t a = type == kQ4CP ? 16 : type == kIQ4NL ? 4 : type == kIQ3S ? 1 : 8;
   if (!aligned(p.w, a) || (pair && !aligned(p.w_up, a))) return false;
   if (type == kQ4CP && (!p.cb || !aligned(p.sc, 16) || (pair && !aligned(p.sc_up, 16)) || p.sstride % 16 ||
                         p.sstride < (k / 256 + (k % 256 != 0)) * 16))
     return false;
-  return type == kQ4CP || type == kIQ4NL || type == kIQ4XS;
+  return type == kQ4CP || type == kIQ4NL || type == kIQ4XS || type == kIQ3S;
 }
 }  // namespace moelut
 
@@ -346,6 +399,8 @@ static bool moe_lut_up(int type, const moelut::LutW& p, const __half* x, const i
     k_moe_lut<moelut::kQ4CP, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
   else if (type == moelut::kIQ4NL)
     k_moe_lut<moelut::kIQ4NL, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
+  else if (type == moelut::kIQ3S)
+    k_moe_lut<moelut::kIQ3S, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
   else
     k_moe_lut<moelut::kIQ4XS, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
   return true;

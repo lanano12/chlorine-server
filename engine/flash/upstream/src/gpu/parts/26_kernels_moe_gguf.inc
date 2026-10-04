@@ -643,6 +643,10 @@ template <> struct UnitW<kQ80> {  // 34-byte blocks are only 2-byte aligned
 
 // Chlorine: raw nonlinear blocks, same 32-element units at P=1 and verify P>1.
 // Weight values stay FP32 on this reference GEMV path.
+// IqUnitW is the per-element reference loader. The UnitW<20/21/23> block loaders
+// below read each 32-element unit's bytes once and evaluate the same FP32
+// expressions as flash_quant::value, so w[] and every dot are bit-identical
+// (gemv_test compares the two loaders on device).
 template<int T> struct IqUnitW {
   float w[32]; int off;
   __device__ __forceinline__ void load(const uint8_t* row,int u) {
@@ -655,9 +659,67 @@ template<int T> struct IqUnitW {
     return y;
   }
 };
-template<> struct UnitW<21> : IqUnitW<21> {};
-template<> struct UnitW<20> : IqUnitW<20> {};
-template<> struct UnitW<23> : IqUnitW<23> {};
+struct IqUnitDot {
+  float w[32]; int off;
+  __device__ __forceinline__ float dot(const float* x) const {
+    float y=0.f;
+    for(int i=0;i<32;++i) y+=w[i]*x[off+i];
+    return y;
+  }
+};
+// IQ3_S sub-block: 8 grid bytes + 8 high bits, 32 sign bits, one 4-bit scale.
+template<> struct UnitW<21> : IqUnitDot {
+  __device__ __forceinline__ void load(const uint8_t* row,int u) {
+    off=u*32;
+    const uint8_t* b=row+(size_t)(u/8)*110; const unsigned sub=u%8;
+    uint64_t qs; uint32_t sg;
+    __builtin_memcpy(&qs,b+2+sub*8,8); __builtin_memcpy(&sg,b+74+sub*4,4);
+    const unsigned qh=b[66+sub], s=(b[106+sub/2]>>(4*(sub%2)))&15;
+    const float d=flash_quant::half_value(flash_quant::u16(b))*float(1+2*s);
+#pragma unroll
+    for(int g=0;g<8;++g) {
+      const uint32_t grid=flash_quant::grid3(int((qs>>(8*g))&255)|int(((qh>>g)&1)<<8));
+#pragma unroll
+      for(int j=0;j<4;++j) {
+        const float v=d*float(int((grid>>(8*j))&255));
+        w[4*g+j]=(sg>>(4*g+j))&1 ? -v : v;
+      }
+    }
+  }
+};
+// IQ4_NL block: fp16 d + 16 code bytes (low nibbles = elements 0..15, high = 16..31).
+template<> struct UnitW<20> : IqUnitDot {
+  __device__ __forceinline__ void load(const uint8_t* row,int u) {
+    off=u*32;
+    const uint8_t* b=row+(size_t)u*18;
+    uint64_t q[2];
+    __builtin_memcpy(q,b+2,16);
+    const float d=flash_quant::half_value(flash_quant::u16(b));
+#pragma unroll
+    for(int j=0;j<16;++j) {
+      const unsigned code=unsigned(q[j>>3]>>(8*(j&7)))&255;
+      w[j]=d*float(flash_quant::grid4(code&15));
+      w[j+16]=d*float(flash_quant::grid4(code>>4));
+    }
+  }
+};
+// IQ4_XS sub-block: 6-bit scale (4 low bits in scales_l, 2 high in scales_h) + 16 code bytes.
+template<> struct UnitW<23> : IqUnitDot {
+  __device__ __forceinline__ void load(const uint8_t* row,int u) {
+    off=u*32;
+    const uint8_t* b=row+(size_t)(u/8)*136; const unsigned sub=u%8;
+    const int scale=int(((b[4+sub/2]>>(4*(sub%2)))&15) | (((flash_quant::u16(b+2)>>(2*sub))&3)<<4))-32;
+    uint64_t q[2];
+    __builtin_memcpy(q,b+8+sub*16,16);
+    const float d=flash_quant::half_value(flash_quant::u16(b))*float(scale);
+#pragma unroll
+    for(int j=0;j<16;++j) {
+      const unsigned code=unsigned(q[j>>3]>>(8*(j&7)))&255;
+      w[j]=d*float(flash_quant::grid4(code&15));
+      w[j+16]=d*float(flash_quant::grid4(code>>4));
+    }
+  }
+};
 
 // dot(row unit u, x[unit u elements]) for one weight row in raw GGUF layout
 template <int T>
