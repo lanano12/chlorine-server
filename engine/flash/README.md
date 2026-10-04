@@ -26,15 +26,27 @@ Each successful engine build writes `chlorine-flash.build.json`, binding its SHA
 
 ## Speed paths and switches (2026-10-04)
 
-Three kernel changes are always on and bit-identical to what they replace: IQ3_S experts run on the staged lookup-table prefill kernel (`k_moe_lut<kIQ3S>`), the expert decode GEMV loads IQ3_S/IQ4_NL/IQ4_XS units a block at a time, and the Q6_K head decodes a block at a time. `moe_test`, `gemv_test` and `mapping_gpu_test` compare each with its retained per-element reference and require zero differing bits. `GDEC_FLASH_IQ3_SCALAR=1` selects the original IQ3_S prefill kernel.
+**Always on, bit-identical to what they replace.** Each has a retained reference kernel and a test that requires zero differing bits (`moe_test`, `gemv_test`, `mapping_gpu_test`).
 
-Opt-in switches that change arithmetic, passed through the supervisor's `--engine-env`:
+- IQ3_S experts run on the staged lookup-table prefill kernel (`k_moe_lut<kIQ3S>`), decoded in packed FP16 as `(magnitude × (1+2s)) × d`: the first product is an integer below 2,048, so one rounding remains. `GDEC_FLASH_IQ3_SCALAR=1` selects the original kernel.
+- Expert token tiles hold 160 slots instead of 64, so a busy expert's weights are decoded once per tile of 160 tokens. `GDEC_FLASH_MOE_TILE=64|128|192|256` selects another size.
+- The shared-expert add is folded into the routed reduce in batched prefill (`GDEC_MOE_SG_FUSE=0` restores the separate pass).
+- The expert decode GEMV loads IQ3_S/IQ4_NL/IQ4_XS units a block at a time, and the Q6_K head fetches a row's ten blocks before decoding (`GDEC_FLASH_Q6_LOOP=1` restores the block loop).
+- Router top-k (`k_router_topk`) uses 12 block barriers instead of about 130; the tree kernel's tie rule is kept exactly (`k_router_topk_tree` is the reference).
+- Serial decode fuses neighbouring single-token launches (GDN gates, hyperconnection read and write, shared expert) and reduces the F32 row dot with one barrier in the reference tree's pairing. `GDEC_FLASH_DECODE_FUSE=0` restores the separate launches.
 
-- `GDEC_F32_GEMM_BF16=1`: batched GEMMs (more than 8 rows) on F32 GGUF matrices take the bf16 paths. A matrix qualifies only if every value is exact in bf16, checked on device at first use; the weights then lose nothing and the activations are rounded to bf16 as for the quantized matrices.
+**Opt-in, arithmetic changes** (the fast set), passed through the supervisor's `--engine-env`:
+
+- `GDEC_F32_GEMM_BF16=1`: batched GEMMs (more than 8 rows) on F32 GGUF matrices take the bf16 paths. A matrix qualifies only if every value is exact in bf16, checked on device at first use; the weights then lose nothing and the activations are rounded to bf16 as for the quantized matrices. With `GDEC_GR_BF16=1` the F32 inject matrices also join the fused scatter-norm-inject kernel through the same exact copy.
 - `GDEC_GR_BF16=1`: bf16 residual stream in batched prefill. Rejected for GGUF unless `GDEC_F32_GEMM_BF16=1` is also set.
+- `GDEC_QSA_UNION=1` (imported): sparse prefill attention over the union of four neighbouring queries' selected blocks.
+- `GDEC_QSA_DENSE_UNION=1` (needs `GDEC_QSA_UNION`): the dense attention prefix (positions below 2,051) runs on the same union WMMA kernel with "every earlier block" lists, instead of the per-row dense kernel.
+- `GDEC_FLASH_PAIRS_F16=1`: expert pair rows are stored as FP16 between the down kernel and the reduce.
 - The imported production switches (`GDEC_QSA_KV_BF16`, `GDEC_QSA_WMMA`, `GDEC_QSA_WMMA_BTV`, `GDEC_GDN_STREAM`, `GDEC_GDN_WAVE`, `GDEC_GDN_FUSED`, `GDEC_GEMM_WMMA`, `GDEC_INDEX_FUSED2`, `GDEC_INDEX_STREAM_SELECT`, `GDEC_PP_MOE_OUT`).
 
-Diagnostics: `GDEC_PHASE=3` prints named sub-layer prefill times per chunk and `GDEC_PERF=1` prints decode time per token by phase; both synchronise the stream and are never throughput measurements. Mechanisms, measurements and the quality-gate results are in the parent's [`variant-flash/TECHNIQUES.md`](../../../variant-flash/TECHNIQUES.md).
+**Opt-in, scheduling only.** `GDEC_GDN_ZLAP=1` issues the GDN `in_proj_z` GEMM on a side stream beside the fused GDN scan (which leaves the GPU partly idle). Kernels and operands are unchanged, so results are those of the same switch set without it.
+
+Diagnostics: `GDEC_PHASE=3` prints named sub-layer prefill times per chunk, `GDEC_PERF=1` prints decode time per token by phase, and both together add per-step decode timers. They synchronise the stream and are never throughput measurements. Mechanisms, measurements and the quality-gate results are in the parent's [`variant-flash/TECHNIQUES.md`](../../../variant-flash/TECHNIQUES.md).
 
 ## Runtime boundaries
 
@@ -44,7 +56,7 @@ Default engine: `127.0.0.1:8742`. Default API: `127.0.0.1:8733`. Model id: `chlo
 
 `CAPS` returns `C` followed by versioned JSON (protocol `chlorine-flash-engine`, version 1), with context, chunk, slots, KV precision, drafter, checkpoint/binary identity from the supervisor, PLE/decay semantics, head dtype and explicit pending qualification. Historical `INFO`, `GEN`, `T`, `D`, `X` and `MEM` remain available. `/health` validates the engine's capability reply and reports its identity and PLE mode, with readiness separate from release qualification. An absent/malformed reply produces 503 with unknown identity, not a guessed mode. The Flash D grammar has twelve fields; do not parse it as the 27B ten-field variant.
 
-F32 GGUF matrices now stay F32. Scalar rows use a fixed-tree FP32 GEMV; prefill uses rocBLAS SGEMM. Accumulation order can differ between these operations, so this is not a serial-versus-batch equivalence claim. `GDEC_GR_BF16` is rejected with GGUF until its F32-input path is qualified. Other upstream experimental modes remain opt-in; the supervisor clears them. IQ3_S WMMA rounds operands to f16 and accumulates in f32; the host format decoder's bit equality does not prove WMMA output equality.
+By default F32 GGUF matrices stay F32. Scalar rows use a fixed-order FP32 GEMV; prefill uses rocBLAS SGEMM. Accumulation order can differ between these operations, so this is not a serial-versus-batch equivalence claim. `GDEC_GR_BF16` is rejected with GGUF unless `GDEC_F32_GEMM_BF16=1` is set (see above). Other upstream experimental modes remain opt-in; the supervisor clears them. IQ3_S WMMA rounds operands to f16 and accumulates in f32; the host format decoder's bit equality does not prove WMMA output equality.
 
 ## Packed head and GGUF decay
 

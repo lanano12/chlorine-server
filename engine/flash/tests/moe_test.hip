@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
     fprintf(stderr,"SKIP: HIP device unavailable; no GPU correctness claim\n"); return 77;
   }
   std::string hgn_path, synth;
-  int layer = 0, P = 2048, iters = 10, check_e = 8, topk = 10, E_synth = 128;
+  int layer = 0, P = 2048, iters = 10, check_e = 8, topk = 10, E_synth = 128, tile = 64;
   unsigned seed = 1;
   double tol = 1e-2;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -114,6 +114,7 @@ int main(int argc, char** argv) {
     else if (a == "--P") P = atoi(argv[i + 1]);
     else if (a == "--E") E_synth = atoi(argv[i + 1]);
     else if (a == "--iters") iters = atoi(argv[i + 1]);
+    else if (a == "--tile") tile = atoi(argv[i + 1]);
     else if (a == "--check-experts") check_e = atoi(argv[i + 1]);
     else if (a == "--seed") seed = (unsigned)atoi(argv[i + 1]);
     else if (a == "--tol") tol = atof(argv[i + 1]);
@@ -211,9 +212,9 @@ int main(int argc, char** argv) {
   }
   std::vector<MoeTile> tiles;
   for (int e = 0; e < E; e++)
-    for (int r = eoff[e]; r < eoff[e + 1]; r += 64) tiles.push_back({e, r, std::min(64, eoff[e + 1] - r)});
+    for (int r = eoff[e]; r < eoff[e + 1]; r += tile) tiles.push_back({e, r, std::min(tile, eoff[e + 1] - r)});
   const int ntiles = (int)tiles.size();
-  const int max_tiles = (npairs + 63) / 64 + E;  // engine's grid bound
+  const int max_tiles = (npairs + tile - 1) / tile + E;  // engine's grid bound
 
   std::normal_distribution<float> nd(0.f, 1.f);
   std::vector<__half> xh((size_t)P * D);
@@ -237,13 +238,13 @@ int main(int argc, char** argv) {
   CK(hipMemset(d_pairs, 0xFF, (size_t)npairs * D * 4));  // NaN
 
   auto run_up = [&]() {
-    if (!((t_gu==moelut::kQ4CP) ? moe_lut_up(t_gu,pgu,d_x,d_tok,d_tiles,d_nt,max_tiles,d_hid,MID,D,0) : flash_moe_up(t_gu,pgu.w,pgu.w_up,d_x,d_tok,d_tiles,d_nt,max_tiles,d_hid,MID,D,0))) {
+    if (!((t_gu==moelut::kQ4CP) ? moe_lut_up(t_gu,pgu,d_x,d_tok,d_tiles,d_nt,max_tiles,d_hid,MID,D,0) : flash_moe_up(t_gu,pgu.w,pgu.w_up,d_x,d_tok,d_tiles,d_nt,max_tiles,d_hid,MID,D,0,tile))) {
       fprintf(stderr, "moe_lut_up: unsupported\n");
       exit(2);
     }
   };
   auto run_dn = [&]() {
-    if (!((t_dn_type==moelut::kQ4CP) ? moe_lut_down(t_dn_type,pdn,d_hid,d_tiles,d_nt,max_tiles,d_pairs,D,MID,0) : flash_moe_down(t_dn_type,pdn.w,d_hid,d_tiles,d_nt,max_tiles,d_pairs,D,MID,0))) {
+    if (!((t_dn_type==moelut::kQ4CP) ? moe_lut_down(t_dn_type,pdn,d_hid,d_tiles,d_nt,max_tiles,d_pairs,D,MID,0) : flash_moe_down(t_dn_type,pdn.w,d_hid,d_tiles,d_nt,max_tiles,d_pairs,D,MID,0,tile))) {
       fprintf(stderr, "moe_lut_down: unsupported\n");
       exit(2);
     }
@@ -260,7 +261,43 @@ int main(int argc, char** argv) {
   CK(hipMemcpy(hid.data(), d_hid, hid.size() * 2, hipMemcpyDeviceToHost));
   CK(hipMemcpy(pairs.data(), d_pairs, pairs.size() * 4, hipMemcpyDeviceToHost));
   bool ok = true;
-  if (t_gu == 21) {
+  if (tile != 64) {
+    // A larger tile only shares the weight decode between more slots: both outputs
+    // must match the 64-slot tiling bit for bit.
+    std::vector<MoeTile> t64;
+    for (int e = 0; e < E; e++)
+      for (int r = eoff[e]; r < eoff[e + 1]; r += 64) t64.push_back({e, r, std::min(64, eoff[e + 1] - r)});
+    const int n64 = (int)t64.size(), max64 = (npairs + 63) / 64 + E;
+    MoeTile* d_t64;
+    int* d_n64;
+    __half* d_hid64;
+    float* d_pairs64;
+    CK(hipMalloc(&d_t64, (size_t)max64 * sizeof(MoeTile)));
+    CK(hipMalloc(&d_n64, 4));
+    CK(hipMalloc(&d_hid64, hid.size() * 2));
+    CK(hipMalloc(&d_pairs64, pairs.size() * 4));
+    CK(hipMemcpy(d_t64, t64.data(), n64 * sizeof(MoeTile), hipMemcpyHostToDevice));
+    CK(hipMemcpy(d_n64, &n64, 4, hipMemcpyHostToDevice));
+    if (!flash_moe_up(t_gu, pgu.w, pgu.w_up, d_x, d_tok, d_t64, d_n64, max64, d_hid64, MID, D, 0) ||
+        !flash_moe_down(t_dn_type, pdn.w, d_hid64, d_t64, d_n64, max64, d_pairs64, D, MID, 0)) {
+      fprintf(stderr, "64-slot reference unsupported\n");
+      return 2;
+    }
+    CK(hipGetLastError());
+    CK(hipDeviceSynchronize());
+    std::vector<__half> hid64(hid.size());
+    std::vector<float> pairs64(pairs.size());
+    CK(hipMemcpy(hid64.data(), d_hid64, hid64.size() * 2, hipMemcpyDeviceToHost));
+    CK(hipMemcpy(pairs64.data(), d_pairs64, pairs64.size() * 4, hipMemcpyDeviceToHost));
+    size_t dh = 0, dp = 0;
+    for (size_t i = 0; i < hid.size(); i++) dh += std::memcmp(&hid[i], &hid64[i], 2) != 0;
+    for (size_t i = 0; i < pairs.size(); i++) dp += std::memcmp(&pairs[i], &pairs64[i], 4) != 0;
+    printf("tile %d vs 64: hid bit_diffs %zu / %zu, pairs bit_diffs %zu / %zu\n", tile, dh, hid.size(), dp,
+           pairs.size());
+    if (dh || dp) ok = false;
+    CK(hipFree(d_t64)); CK(hipFree(d_n64)); CK(hipFree(d_hid64)); CK(hipFree(d_pairs64));
+  }
+  if (t_gu == 21 && tile == 64) {
     // The LUT-staged IQ3_S kernel must reproduce the original per-element kernel exactly.
     __half* d_hid2;
     CK(hipMalloc(&d_hid2, hid.size() * 2));

@@ -52,28 +52,29 @@ static moelut::LutW flash_iq_weights(const uint8_t* w,const uint8_t* up,int rows
   return moelut::LutW{w,up,nullptr,nullptr,nullptr,0,rows,0};
 }
 static bool flash_moe_up(int type,const uint8_t* gate,const uint8_t* up,const __half* x,
-  const int* tokidx,const MoeTile* tiles,const int* ntiles,int max_tiles,__half* hid,int m,int k,hipStream_t st) {
+  const int* tokidx,const MoeTile* tiles,const int* ntiles,int max_tiles,__half* hid,int m,int k,hipStream_t st,
+  int tile=64) {
   if(type==21) {
     if(k%256 || m%64) return false;
     // LUT-staged kernel by default; GDEC_FLASH_IQ3_SCALAR=1 keeps the original
     // per-element kernel. Their outputs are bit-identical (moe_test checks it).
     static const bool scalar=getenv("GDEC_FLASH_IQ3_SCALAR")!=nullptr;
-    if(!scalar) return moe_lut_up(21,flash_iq_weights(gate,up,m),x,tokidx,tiles,ntiles,max_tiles,hid,m,k,st);
+    if(!scalar) return moe_lut_up(21,flash_iq_weights(gate,up,m),x,tokidx,tiles,ntiles,max_tiles,hid,m,k,st,tile);
+    if(tile!=64) return false;
     k_flash_iq3_up<<<dim3((m+63)/64,max_tiles),256,0,st>>>(gate,up,x,tokidx,tiles,ntiles,hid,m,k);
     return true;
   }
-  if(type==20 || type==23) {
-    moe_lut_up(type,flash_iq_weights(gate,up,m),x,tokidx,tiles,ntiles,max_tiles,hid,m,k,st);
-    return true;
-  }
+  if(type==20 || type==23)
+    return moe_lut_up(type,flash_iq_weights(gate,up,m),x,tokidx,tiles,ntiles,max_tiles,hid,m,k,st,tile);
+  if(tile!=64) return false;  // the raw-block kernels are 64-slot only
   return moe_gg_up(type,gate,up,x,tokidx,tiles,ntiles,max_tiles,hid,m,k,st);
 }
 static bool flash_moe_down(int type,const uint8_t* down,const __half* hid,
-  const MoeTile* tiles,const int* ntiles,int max_tiles,float* pairs,int m,int k,hipStream_t st) {
-  if(type==20) {
-    moe_lut_down(type,flash_iq_weights(down,nullptr,m),hid,tiles,ntiles,max_tiles,pairs,m,k,st);
-    return true;
-  }
+  const MoeTile* tiles,const int* ntiles,int max_tiles,float* pairs,int m,int k,hipStream_t st,int tile=64,
+  bool half_pairs=false) {
+  if(type==20)
+    return moe_lut_down(type,flash_iq_weights(down,nullptr,m),hid,tiles,ntiles,max_tiles,pairs,m,k,st,tile,half_pairs);
+  if(tile!=64 || half_pairs) return false;
   return moe_gg_down(type,down,hid,tiles,ntiles,max_tiles,pairs,m,k,st);
 }
 static bool flash_moe_gemv(int gu,int dn,const uint8_t* gate,const uint8_t* up,
@@ -90,6 +91,30 @@ static bool flash_moe_gemv(int gu,int dn,const uint8_t* gate,const uint8_t* up,
   if(dn==20) k_moe_gg_gemv_dn<20,8,10><<<db,256,0,st>>>(down,hid,ids,ws,out,d,mid,stride,P);
   else k_moe_gg_gemv_dn<8,8,10><<<db,256,0,st>>>(down,hid,ids,ws,out,d,mid,stride,P);
   return true;
+}
+// Weighted deterministic reduce over F16 pair rows, with the optional shared-expert
+// add. Same slot order and FP32 accumulation as k_moe_reduce_pw / _sg; only the
+// pair rows were rounded to F16 by the down kernel (GDEC_FLASH_PAIRS_F16).
+template <int K>
+__global__ void k_flash_reduce_pw_f16(const __half* __restrict__ pairs,const int* __restrict__ pairids,
+                                      const float* __restrict__ pw,const float* __restrict__ ey,
+                                      const float* __restrict__ sg,float* __restrict__ out,int P,int Dd) {
+  __shared__ int ids[K];
+  int tid=threadIdx.x;
+  int t=blockIdx.y,d=tid+(int)blockIdx.x*blockDim.x;
+  if(t>=P) return;
+  if(tid<K) ids[tid]=pairids[t*K+tid];
+  __syncthreads();
+  if(d>=Dd) return;
+  float sum=0.f;
+#pragma unroll
+  for(int s=0;s<K;s++) sum+=pw[ids[s]]*__half2float(pairs[(size_t)ids[s]*Dd+d]);
+  const size_t i=(size_t)t*Dd+d;
+  if(ey) {
+    float s=1.f/(1.f+expf(-sg[t]));
+    sum+=s*ey[i];
+  }
+  out[i]=sum;
 }
 // F32 matrices remain F32 in the GGUF mapping (routers, HC injection, GDN gates).
 // GDEC_F32_GEMM_BF16: batched GEMMs may read such a matrix as bf16 when every value
@@ -129,10 +154,36 @@ __global__ void k_flash_q6_gemv_scalar(const uint8_t* w,const void* x,float* out
 }
 // A lane owns the elements whose in-group index equals its lane id, so per
 // (block, half) it needs two low-nibble bytes, one high-bit byte, eight scale
-// bytes and the block's d. Reading those once replaces five byte loads and one
-// half conversion per element; the element order and FP32 expressions are the
-// scalar kernel's, so the sums are bit-identical.
-template<bool XBf16=false>
+// bytes and the block's d. The element order and FP32 expressions are the scalar
+// kernel's, so the sums are bit-identical. BLOCKS > 0 (a row of exactly that many
+// 256-element blocks) fetches the whole row before any arithmetic, so a wave
+// waits on memory once instead of once per half block.
+struct FlashQ6Half { uint32_t codes; uint64_t scales; };  // codes = q0 | q1 << 8 | qh << 16
+__device__ __forceinline__ FlashQ6Half flash_q6_fetch(const uint8_t* b,int half,int lane) {
+  FlashQ6Half h;
+  h.codes=uint32_t(b[half*64+lane]) | (uint32_t(b[half*64+32+lane])<<8) | (uint32_t(b[128+half*32+lane])<<16);
+  __builtin_memcpy(&h.scales,b+192+half*8,8);
+  return h;
+}
+template<bool XBf16>
+__device__ __forceinline__ void flash_q6_half(const FlashQ6Half& h,float d,int base,int lane,
+                                              const void* x,int P,size_t xs,float* sum) {
+  const unsigned q0=h.codes&255,q1=(h.codes>>8)&255,qh=h.codes>>16;
+#pragma unroll
+  for(int group=0;group<4;++group) {
+    const unsigned low=group%2 ? q1 : q0;
+    const unsigned code=((low>>(group>=2?4:0))&15) | (((qh>>(group*2))&3)<<4);
+    const int scale=int(int8_t((h.scales>>(8*(group*2+lane/16)))&255));
+    const float weight=(d*float(scale))*float(int(code)-32);
+    const int c=base+group*32+lane;
+    for(int t=0;t<P;t++) {
+      const float xv=XBf16 ? __uint_as_float(unsigned(((const uint16_t*)x)[t*xs+c])<<16)
+                          : ((const float*)x)[t*xs+c];
+      sum[t]+=weight*xv;
+    }
+  }
+}
+template<bool XBf16=false,int BLOCKS=0>
 __global__ void k_flash_q6_gemv(const uint8_t* w,const void* x,float* out,
                               int rows,int cols,int P,size_t xs) {
   const int lane=threadIdx.x%32,r=blockIdx.x*8+threadIdx.x/32;
@@ -140,27 +191,28 @@ __global__ void k_flash_q6_gemv(const uint8_t* w,const void* x,float* out,
   const int blocks=cols/256;
   const uint8_t* row=w+(size_t)r*blocks*210;
   float sum[8]={};
-  for(int blk=0;blk<blocks;++blk) {
-    const uint8_t* b=row+(size_t)blk*210;
-    const float d=flash_quant::half_value(flash_quant::u16(b+208));
+  if constexpr (BLOCKS>0) {
+    FlashQ6Half raw[BLOCKS][2];
+    uint32_t dbits[BLOCKS];
 #pragma unroll
-    for(int half=0;half<2;++half) {
-      const unsigned q0=b[half*64+lane],q1=b[half*64+32+lane],qh=b[128+half*32+lane];
-      uint64_t sc;
-      __builtin_memcpy(&sc,b+192+half*8,8);
+    for(int blk=0;blk<BLOCKS;++blk) {
+      const uint8_t* b=row+(size_t)blk*210;
+      dbits[blk]=flash_quant::u16(b+208);
+      raw[blk][0]=flash_q6_fetch(b,0,lane);
+      raw[blk][1]=flash_q6_fetch(b,1,lane);
+    }
 #pragma unroll
-      for(int group=0;group<4;++group) {
-        const unsigned low=group%2 ? q1 : q0;
-        const unsigned code=((low>>(group>=2?4:0))&15) | (((qh>>(group*2))&3)<<4);
-        const int scale=int(int8_t((sc>>(8*(group*2+lane/16)))&255));
-        const float weight=(d*float(scale))*float(int(code)-32);
-        const int c=blk*256+half*128+group*32+lane;
-        for(int t=0;t<P;t++) {
-          const float xv=XBf16 ? __uint_as_float(unsigned(((const uint16_t*)x)[t*xs+c])<<16)
-                              : ((const float*)x)[t*xs+c];
-          sum[t]+=weight*xv;
-        }
-      }
+    for(int blk=0;blk<BLOCKS;++blk) {
+      const float d=flash_quant::half_value(uint16_t(dbits[blk]));
+      flash_q6_half<XBf16>(raw[blk][0],d,blk*256,lane,x,P,xs,sum);
+      flash_q6_half<XBf16>(raw[blk][1],d,blk*256+128,lane,x,P,xs,sum);
+    }
+  } else {
+    for(int blk=0;blk<blocks;++blk) {
+      const uint8_t* b=row+(size_t)blk*210;
+      const float d=flash_quant::half_value(flash_quant::u16(b+208));
+      flash_q6_half<XBf16>(flash_q6_fetch(b,0,lane),d,blk*256,lane,x,P,xs,sum);
+      flash_q6_half<XBf16>(flash_q6_fetch(b,1,lane),d,blk*256+128,lane,x,P,xs,sum);
     }
   }
   for(int t=0;t<P;t++) {
@@ -173,13 +225,136 @@ static void flash_q6_gemv(const uint8_t* w,const void* x,float* out,int rows,
                          int cols,int P,size_t xs,bool bf16,hipStream_t st) {
   if(rows<1 || cols<1 || cols%256 || P<1 || P>8 || xs<(size_t)cols)
     throw std::runtime_error("flash Q6_K GEMV: invalid shape");
+  // GDEC_FLASH_Q6_LOOP=1 keeps the per-block loop for every width (A/B checks).
+  static const bool loop=getenv("GDEC_FLASH_Q6_LOOP")!=nullptr;
+  if(cols==2560 && !loop) {
+    if(bf16)k_flash_q6_gemv<true,10><<<(rows+7)/8,256,0,st>>>(w,x,out,rows,cols,P,xs);
+    else k_flash_q6_gemv<false,10><<<(rows+7)/8,256,0,st>>>(w,x,out,rows,cols,P,xs);
+    return;
+  }
   if(bf16)k_flash_q6_gemv<true><<<(rows+7)/8,256,0,st>>>(w,x,out,rows,cols,P,xs);
   else k_flash_q6_gemv<false><<<(rows+7)/8,256,0,st>>>(w,x,out,rows,cols,P,xs);
 }
-__global__ void k_flash_f32_gemv(const float* w,const float* x,float* out,int n,int k,size_t xs) {
+// Reference F32 row dot: 256 lane partials (lane t takes columns t, t + 256, ...)
+// reduced by a 256-entry LDS tree with a barrier per level. Kept for the tests.
+__global__ void k_flash_f32_gemv_tree(const float* w,const float* x,float* out,int n,int k,size_t xs) {
   int r=blockIdx.x,t=blockIdx.y,tid=threadIdx.x;
   float v=0;for(int c=tid;c<k;c+=256)v+=w[(size_t)r*k+c]*x[(size_t)t*xs+c];
   __shared__ float sum[256];sum[tid]=v;__syncthreads();
   for(int s=128;s;s>>=1){if(tid<s)sum[tid]+=sum[tid+s];__syncthreads();}
   if(tid==0)out[(size_t)t*n+r]=sum[0];
+}
+// The same tree with one barrier. Level s adds entry t + s into entry t, so
+// levels 128, 64, 32 pair waves (w, w + 4), (w, w + 2), (w, w + 1) of one lane
+// column and levels 16 .. 1 pair lanes inside wave 0. Each lane therefore sums
+// its column's eight partials from LDS in that pairing, then the lanes combine
+// by shuffle in the same order. Every addition has the tree's two operands, so
+// the total is bit for bit the tree's, and every thread of the block gets it.
+// 256-thread blocks only; sum is a __shared__ float[256].
+__device__ __forceinline__ float flash_tree256(float v,float* sum) {
+  const int tid=threadIdx.x,lane=tid&31;
+  sum[tid]=v;__syncthreads();
+  float c[8];
+#pragma unroll
+  for(int w=0;w<8;w++)c[w]=sum[lane+32*w];
+#pragma unroll
+  for(int half=4;half;half>>=1)
+#pragma unroll
+    for(int w=0;w<half;w++)c[w]+=c[w+half];
+  float t=c[0];
+#pragma unroll
+  for(int off=16;off;off>>=1)t+=__shfl_xor(t,off,32);
+  return t;
+}
+__global__ void k_flash_f32_gemv(const float* w,const float* x,float* out,int n,int k,size_t xs) {
+  int r=blockIdx.x,t=blockIdx.y,tid=threadIdx.x;
+  float v=0;for(int c=tid;c<k;c+=256)v+=w[(size_t)r*k+c]*x[(size_t)t*xs+c];
+  __shared__ float sum[256];
+  const float total=flash_tree256(v,sum);
+  if(tid==0)out[(size_t)t*n+r]=total;
+}
+
+// --- Fused single-token kernels (serial decode) -----------------------------
+// A decoded token issues about 37 small kernels per layer, and every launch
+// costs time whatever its size. Each kernel below replaces two or three
+// neighbouring launches and keeps every expression and summation order of the
+// kernels it replaces (the F32 dots are k_flash_f32_gemv's lane partials and
+// tree order), so decode output does not change: mapping_gpu_test compares
+// each one bit for bit with the launches it replaces. GDEC_FLASH_DECODE_FUSE=0
+// restores the separate launches.
+
+// GDN gates: in_proj_a / in_proj_b (F32, hv rows each) and k_gdn_gates.
+// Block r < hv is head r of a, block r >= hv is head r - hv of b.
+__global__ void k_flash_gdn_ab_gates(const float* wa,const float* wb,const float* x,const float* A_log,
+    const float* dt_bias,float* g_out,float* beta_out,int hv,int k,bool direct_coefficient) {
+  const int r=blockIdx.x,tid=threadIdx.x,h=r<hv?r:r-hv;
+  const float* w=(r<hv?wa:wb)+(size_t)h*k;
+  float v=0;for(int c=tid;c<k;c+=256)v+=w[c]*x[c];
+  __shared__ float sum[256];
+  const float total=flash_tree256(v,sum);
+  if(tid)return;
+  if(r<hv) {
+    float sp=total+dt_bias[h];
+    sp=sp>20.f?sp:log1pf(expf(sp));
+    g_out[h]=(direct_coefficient?A_log[h]:-expf(A_log[h]))*sp;
+  } else {
+    beta_out[h]=1.f/(1.f+expf(-total));
+  }
+}
+// Hyperconnection read tail: k_sigmoid_inplace(G) and k_gr_combine.
+__global__ void k_flash_gr_combine_sig(const float* __restrict__ G,const float* __restrict__ Rhat,
+                                       float* __restrict__ x,int d,int branches) {
+  int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=d)return;
+  float acc=0.f;
+  for(int b=0;b<branches;b++){const float g=1.f/(1.f+expf(-G[b*d+i]));acc+=g*Rhat[b*d+i];}
+  x[i]=acc/branches;
+}
+// Hyperconnection write: the 4 x 4d F32 inject projection and k_gr_write.
+// Every block repeats the four dots (164 KB of weights, cached after the first).
+__global__ void k_flash_gr_write_inj(const float* __restrict__ winj,const float* __restrict__ Rhat,
+                                     float* __restrict__ R,const float* __restrict__ y,int d) {
+  const int tid=threadIdx.x,k=4*d;
+  __shared__ float sum[4][256];
+  float v[4]={0.f,0.f,0.f,0.f};
+  for(int c=tid;c<k;c+=256) {
+    const float xr=Rhat[c];
+#pragma unroll
+    for(int b=0;b<4;b++)v[b]+=winj[(size_t)b*k+c]*xr;
+  }
+  // flash_tree256 for the four dots at once: one barrier, then per-lane column sums.
+  const int lane=tid&31;
+#pragma unroll
+  for(int b=0;b<4;b++)sum[b][tid]=v[b];
+  __syncthreads();
+  float w4[4];
+#pragma unroll
+  for(int b=0;b<4;b++) {
+    float c[8];
+#pragma unroll
+    for(int w=0;w<8;w++)c[w]=sum[b][lane+32*w];
+#pragma unroll
+    for(int half=4;half;half>>=1)
+#pragma unroll
+      for(int w=0;w<half;w++)c[w]+=c[w+half];
+    float t=c[0];
+#pragma unroll
+    for(int off=16;off;off>>=1)t+=__shfl_xor(t,off,32);
+    w4[b]=t;
+  }
+  const int i=blockIdx.x*256+tid;
+  if(i>=d)return;
+#pragma unroll
+  for(int b=0;b<4;b++){const float s=2.f/(1.f+expf(-w4[b]*0.25f));R[b*d+i]+=s*y[i];}
+}
+// Shared-expert gate (1 x k F32), k_axpy_sg and the copy to the layer output:
+// y = acc + sigmoid(wsg . x) * ey. Every block repeats the one dot.
+__global__ void k_flash_sg_out(const float* __restrict__ wsg,const float* __restrict__ x,
+    const float* __restrict__ acc,const float* __restrict__ ey,float* __restrict__ y,int d,int k) {
+  const int tid=threadIdx.x;
+  float v=0;for(int c=tid;c<k;c+=256)v+=wsg[c]*x[c];
+  __shared__ float sum[256];
+  const float total=flash_tree256(v,sum);
+  const int i=blockIdx.x*256+tid;
+  if(i<d){const float s=1.f/(1.f+expf(-total));y[i]=acc[i]+s*ey[i];}
 }

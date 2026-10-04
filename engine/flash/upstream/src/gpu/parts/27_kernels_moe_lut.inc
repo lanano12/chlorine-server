@@ -18,11 +18,13 @@
 //
 // Chlorine addition, GGUF IQ3_S (110 B / 256: fp16 d, qs[64], qh[8], signs[32],
 //   scales[4]): gate/up only. A 32-element sub-block stages its 8 grid bytes, 8
-//   high bits, 32 sign bits and FP32 scale d * (1 + 2 * s); decode = 8 lookups in
-//   an LDS table of the 512 grid rows as FP32 magnitudes, then
-//   w = f16(scale * magnitude) with the sign bit applied. That is the scalar
-//   flash_quant::value expression, so the fragments, the per-16-column WMMA
-//   order and the epilogue reproduce k_flash_iq3_up bit for bit.
+//   high bits, 32 sign bits, the block's fp16 d and the fp16 integer 1 + 2 * s;
+//   decode = 8 lookups in an LDS table of the 512 grid rows as fp16 magnitudes,
+//   then w = (magnitude * (1 + 2 * s)) * d in fp16 with the sign bit applied.
+//   The first product is an integer below 2048, exact in fp16, so the second is
+//   the one correctly rounded product of the exact weight: the same value as
+//   f16(flash_quant::value). Fragments, per-16-column WMMA order and epilogue
+//   therefore reproduce k_flash_iq3_up bit for bit (moe_test checks it).
 //
 //   kPair (gate/up): hid F16 [slot][m] = up * silu(gate), grid = (m / 64, tiles)
 //   !kPair (down):   pairs F32 [slot][m],                grid = (m / 128, tiles)
@@ -70,6 +72,19 @@ __device__ __forceinline__ uint4 iq_to_pairs(uint4 q) {
                     __builtin_amdgcn_perm(pair_hi(q.w), pair_hi(q.z), sel));
 }
 
+// f(0), f(1), ..., f(N - 1) expanded at compile time. The epilogues index the
+// per-token-tile accumulators; with 16 tiles the compiler declines `#pragma
+// unroll` on a loop that holds barriers, and a real loop would force the
+// accumulators out of registers.
+template <class F, int... J>
+__device__ __forceinline__ void expand_impl(F& f, std::integer_sequence<int, J...>) {
+  (f(J), ...);
+}
+template <int N, class F>
+__device__ __forceinline__ void expand(F f) {
+  expand_impl(f, std::make_integer_sequence<int, N>{});
+}
+
 }  // namespace moelut
 
 template <int kLut, bool kPair, int BN = 64>
@@ -80,7 +95,10 @@ __launch_bounds__(256) __global__
   using namespace moegg;
   using namespace moelut;
   constexpr int BM = 128, BK = 2;
-  static_assert(BN % 16 == 0 && BN <= 64, "BN must match the MoeTile size (<= 64)");
+  // BN slots per tile. A tile decodes its expert's weights once per K stage, so a
+  // larger BN shares that decode between more tokens. Every (row, token) output
+  // still sees the same WMMA sequence, so results do not depend on BN.
+  static_assert(BN % 32 == 0 && BN >= 64 && BN <= 256, "BN: whole 16-slot tiles, 8 x BN activation chunks");
   static_assert(kLut == kQ4CP || kLut == kIQ4NL || kLut == kIQ4XS || kLut == kIQ3S, "LUT type");
   static_assert(kLut != kIQ3S || kPair, "IQ3_S is a gate/up format here");
   constexpr int kTokTiles = BN / 16;
@@ -92,7 +110,7 @@ __launch_bounds__(256) __global__
   constexpr int kLdsBytes = kStageBytes > 8 * 1024 ? kStageBytes : 8 * 1024;
   __shared__ __attribute__((aligned(16))) uint8_t lds[kLdsBytes];
   __shared__ uint32_t s_cbp[256];
-  __shared__ uint4 s_g3[kLut == kIQ3S ? 512 : 1];  // IQ3_S grid rows as 4 x FP32 magnitude
+  __shared__ uint2 s_g3[kLut == kIQ3S ? 512 : 1];  // IQ3_S grid rows as 4 x fp16 magnitude
   auto* s_codes = reinterpret_cast<uint4*>(lds);
   auto* s_scale = reinterpret_cast<uint32_t*>(lds + kCodeBytes);
   auto* s_act = reinterpret_cast<uint4*>(lds + kCodeBytes + kScaleBytes);
@@ -103,10 +121,9 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const uint32_t g = flash_quant::grid3(tid + i * 256);
-      s_g3[tid + i * 256] = make_uint4(__builtin_bit_cast(uint32_t, (float)(g & 255U)),
-                                       __builtin_bit_cast(uint32_t, (float)((g >> 8) & 255U)),
-                                       __builtin_bit_cast(uint32_t, (float)((g >> 16) & 255U)),
-                                       __builtin_bit_cast(uint32_t, (float)(g >> 24)));
+      s_g3[tid + i * 256] = make_uint2(
+          __builtin_bit_cast(uint32_t, __floats2half2_rn((float)(g & 255U), (float)((g >> 8) & 255U))),
+          __builtin_bit_cast(uint32_t, __floats2half2_rn((float)((g >> 16) & 255U), (float)(g >> 24))));
     }
   } else {
     float lo, hi;
@@ -153,7 +170,7 @@ __launch_bounds__(256) __global__
   uint32_t f_sl = 0;  // IQ4_XS: scales_l[0..3]
   int f_ib = 0;       // IQ4_XS: sub-block
   uint4 f_scv = make_uint4(0u, 0u, 0u, 0u);  // q4cp: scales of K blocks kb0 & ~7 .. +7
-  constexpr int kActFetch = 2;
+  constexpr int kActFetch = BN / 32;
   constexpr int kActChunks = BN * BK * 4;
   static_assert(kActChunks <= kActFetch * 256, "activation fetch");
   uint4 a_data[kActFetch];
@@ -227,9 +244,10 @@ __launch_bounds__(256) __global__
     uint32_t s16 = 0;
     if constexpr (kLut == kIQ3S) {
       s_codes[swizzle(row, f_c)] = f_codes;
-      const float db = flash_quant::half_value((uint16_t)(f_s & 0xFFFFU)) *
-                       (float)(1 + 2 * (int)((f_s >> (16 + 4 * (f_ib & 1))) & 15U));
-      s_scale[f_c * BM + row] = f_live ? __builtin_bit_cast(uint32_t, db) : 0U;
+      // Low half: the block's d as stored. High half: 1 + 2 * s as an fp16 integer.
+      const uint32_t mult = __builtin_bit_cast(
+          uint16_t, __float2half((float)(1 + 2 * (int)((f_s >> (16 + 4 * (f_ib & 1))) & 15U))));
+      s_scale[f_c * BM + row] = f_live ? ((f_s & 0xFFFFU) | (mult << 16)) : 0U;
     } else if constexpr (kLut == kQ4CP) {
       s_codes[swizzle(row, f_c)] = f_codes;
       s16 = f_s;
@@ -266,19 +284,23 @@ __launch_bounds__(256) __global__
     for (int kb = 0; kb < BK; ++kb) {
       __half2 h[16];
       if constexpr (kLut == kIQ3S) {
-        const float db = __builtin_bit_cast(float, s_scale[kb * BM + row]);
+        const uint32_t sc = s_scale[kb * BM + row];
+        const __half2 d2 = __builtin_bit_cast(__half2, (sc & 0xFFFFU) * 0x10001U);
+        const __half2 mult2 = __builtin_bit_cast(__half2, (sc >> 16) * 0x10001U);
         const uint32_t qsw[2] = {raw[kb].x, raw[kb].y};
         const uint32_t sg = raw[kb].z, qh = raw[kb].w;
-        const auto signed_w = [db](uint32_t mag, uint32_t neg) {
-          return __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, db * __builtin_bit_cast(float, mag)) ^ (neg << 31));
-        };
 #pragma unroll
         for (int g = 0; g < 8; ++g) {
           const uint32_t idx = ((qsw[g >> 2] >> (8 * (g & 3))) & 0xFFU) | (((qh >> g) & 1U) << 8);
-          const uint4 mg = s_g3[idx];
+          const uint2 mg = s_g3[idx];
           const uint32_t sb = sg >> (4 * g);
-          h[2 * g] = __floats2half2_rn(signed_w(mg.x, sb & 1U), signed_w(mg.y, (sb >> 1) & 1U));
-          h[2 * g + 1] = __floats2half2_rn(signed_w(mg.z, (sb >> 2) & 1U), signed_w(mg.w, (sb >> 3) & 1U));
+          // Sign bits of the two fp16 lanes: element j -> bit 15, element j + 1 -> bit 31.
+          const uint32_t neg_lo = ((sb & 1U) << 15) | ((sb & 2U) << 30);
+          const uint32_t neg_hi = ((sb & 4U) << 13) | ((sb & 8U) << 28);
+          const __half2 lo = __hmul2(__hmul2(__builtin_bit_cast(__half2, mg.x), mult2), d2);
+          const __half2 hi = __hmul2(__hmul2(__builtin_bit_cast(__half2, mg.y), mult2), d2);
+          h[2 * g] = __builtin_bit_cast(__half2, __builtin_bit_cast(uint32_t, lo) ^ neg_lo);
+          h[2 * g + 1] = __builtin_bit_cast(__half2, __builtin_bit_cast(uint32_t, hi) ^ neg_hi);
         }
       } else {
         const __half2 scale2 = __builtin_bit_cast(__half2, s_scale[kb * BM + row]);
@@ -325,9 +347,8 @@ __launch_bounds__(256) __global__
     static_assert(8 * plane * sizeof(float) <= kLdsBytes, "pair epilogue LDS");
     float* base = reinterpret_cast<float*>(lds);
     float* scratch = base + wave_id * plane;
-#pragma unroll
-    for (int j = 0; j < kTokTiles; ++j) {
-      if (j >= live_tok_tiles) break;  // uniform across the block
+    expand<kTokTiles>([&](int j) __attribute__((always_inline)) {
+      if (j >= live_tok_tiles) return;  // uniform across the block
 #pragma unroll
       for (int l = 0; l < 8; ++l) scratch[sub_lane * stride + 2 * l + half_id] = acc[j][l];
       __syncthreads();
@@ -350,16 +371,15 @@ __launch_bounds__(256) __global__
         }
       }
       __syncthreads();
-    }
+    });
     return;
   }
 
   // Down: transpose each 16x16 tile through LDS; one 64 B row segment per slot.
   float* tile_scratch = reinterpret_cast<float*>(lds) + wave_id * 256;
   const int r0 = r_block + wave_id * 16;
-#pragma unroll
-  for (int j = 0; j < kTokTiles; ++j) {
-    if (j >= live_tok_tiles) break;
+  expand<kTokTiles>([&](int j) __attribute__((always_inline)) {
+    if (j >= live_tok_tiles) return;
 #pragma unroll
     for (int l = 0; l < 8; ++l) tile_scratch[sub_lane * 16 + 2 * l + half_id] = acc[j][l];
     __builtin_amdgcn_wave_barrier();
@@ -368,14 +388,20 @@ __launch_bounds__(256) __global__
       const int flat = s * 32 + lane_id;
       const int t = j * 16 + (flat >> 4);
       const int r = r0 + (flat & 15);
-      if (t < nrows && r < m) out[(size_t)(slot0 + t) * m + r] = tile_scratch[flat];
+      // out_half on a down launch: pair rows stored as F16 (GDEC_FLASH_PAIRS_F16).
+      if (t < nrows && r < m) {
+        if (out_half) out_half[(size_t)(slot0 + t) * m + r] = __float2half(tile_scratch[flat]);
+        else out[(size_t)(slot0 + t) * m + r] = tile_scratch[flat];
+      }
     }
     __builtin_amdgcn_wave_barrier();
-  }
+  });
 }
 
 namespace moelut {
 static bool aligned(const void* ptr, uintptr_t a) { return ((uintptr_t)ptr & (a - 1)) == 0; }
+// Tile sizes the IQ kernels are instantiated for (64 is always available).
+static bool tile_ok(int tile) { return tile == 128 || tile == 160 || tile == 192 || tile == 256; }
 static bool lut_ok(int type, const LutW& p, bool pair, int k) {
   if (type == kIQ3S && !pair) return false;
   if (k % (type == kIQ4XS || type == kIQ3S ? 256 : 64)) return false;
@@ -392,31 +418,56 @@ static bool lut_ok(int type, const LutW& p, bool pair, int k) {
 // type: moelut::kQ4CP / kIQ4NL / kIQ4XS. Returns false when unsupported.
 static bool moe_lut_up(int type, const moelut::LutW& p, const __half* x, const int* tokidx,
                        const MoeTile* tiles, const int* ntiles, int max_tiles, __half* hid, int m,
-                       int k, hipStream_t st) {
+                       int k, hipStream_t st, int tile = 64) {
   if (m % 64 || !moelut::lut_ok(type, p, true, k)) return false;
+  if (tile != 64 && !(type != moelut::kQ4CP && moelut::tile_ok(tile))) return false;
   dim3 grid(m / 64, max_tiles);
-  if (type == moelut::kQ4CP)
-    k_moe_lut<moelut::kQ4CP, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
-  else if (type == moelut::kIQ4NL)
-    k_moe_lut<moelut::kIQ4NL, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
-  else if (type == moelut::kIQ3S)
-    k_moe_lut<moelut::kIQ3S, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
-  else
-    k_moe_lut<moelut::kIQ4XS, true><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr, hid, m, k);
+#define GDEC_LUT_UP(T, BN) \
+  k_moe_lut<T, true, BN><<<grid, 256, 0, st>>>(p, x, tokidx, tiles, ntiles, nullptr, hid, m, k)
+#define GDEC_LUT_UP_TILES(T)                 \
+  if (tile == 64) GDEC_LUT_UP(T, 64);        \
+  else if (tile == 128) GDEC_LUT_UP(T, 128); \
+  else if (tile == 160) GDEC_LUT_UP(T, 160); \
+  else if (tile == 192) GDEC_LUT_UP(T, 192); \
+  else GDEC_LUT_UP(T, 256)
+  if (type == moelut::kQ4CP) {
+    GDEC_LUT_UP(moelut::kQ4CP, 64);
+  } else if (type == moelut::kIQ4NL) {
+    GDEC_LUT_UP_TILES(moelut::kIQ4NL);
+  } else if (type == moelut::kIQ3S) {
+    GDEC_LUT_UP_TILES(moelut::kIQ3S);
+  } else {
+    GDEC_LUT_UP_TILES(moelut::kIQ4XS);
+  }
+#undef GDEC_LUT_UP_TILES
+#undef GDEC_LUT_UP
   return true;
 }
 
 // down: pairs[slot][m] F32 (unweighted), hid = F16 [slot][k].
 static bool moe_lut_down(int type, const moelut::LutW& p, const __half* hid, const MoeTile* tiles,
-                         const int* ntiles, int max_tiles, float* pairs, int m, int k, hipStream_t st) {
+                         const int* ntiles, int max_tiles, float* pairs, int m, int k, hipStream_t st,
+                         int tile = 64, bool half_pairs = false) {
   if (m % 128 || !moelut::lut_ok(type, p, false, k)) return false;
+  if (tile != 64 && !(type == moelut::kIQ4NL && moelut::tile_ok(tile))) return false;
   dim3 grid(m / 128, max_tiles);
-  if (type == moelut::kQ4CP)
-    k_moe_lut<moelut::kQ4CP, false><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
-  else if (type == moelut::kIQ4NL)
-    k_moe_lut<moelut::kIQ4NL, false><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
-  else
-    k_moe_lut<moelut::kIQ4XS, false><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+  // half_pairs: the pairs buffer receives F16 rows (same slot layout, half the bytes).
+  float* const out32 = half_pairs ? nullptr : pairs;
+  __half* const out16 = half_pairs ? reinterpret_cast<__half*>(pairs) : nullptr;
+#define GDEC_LUT_DN(T, BN) \
+  k_moe_lut<T, false, BN><<<grid, 256, 0, st>>>(p, hid, nullptr, tiles, ntiles, out32, out16, m, k)
+  if (type == moelut::kQ4CP) {
+    GDEC_LUT_DN(moelut::kQ4CP, 64);
+  } else if (type == moelut::kIQ4NL) {
+    if (tile == 64) GDEC_LUT_DN(moelut::kIQ4NL, 64);
+    else if (tile == 128) GDEC_LUT_DN(moelut::kIQ4NL, 128);
+    else if (tile == 160) GDEC_LUT_DN(moelut::kIQ4NL, 160);
+    else if (tile == 192) GDEC_LUT_DN(moelut::kIQ4NL, 192);
+    else GDEC_LUT_DN(moelut::kIQ4NL, 256);
+  } else {
+    GDEC_LUT_DN(moelut::kIQ4XS, 64);
+  }
+#undef GDEC_LUT_DN
   return true;
 }
 

@@ -519,7 +519,9 @@ __global__ void k_bf16_gemv(const uint16_t* __restrict__ w, const float* __restr
 // blocks. For the decode shapes where k_q8g32_gemv_mr<1> (2 rows per wave,
 // 512-thread blocks) runs below bandwidth: few rows (2560 x 6144: only 80
 // blocks on 40 CUs) or short rows (640 cols = 20 groups < 32 lanes).
-template <int LPR>
+// Chlorine: SILU4 folds k_silu_scale(y, 0.25) into the store (the hyperconnection
+// mix-down's next step in decode), saving a launch; same expression per element.
+template <int LPR, bool SILU4 = false>
 __global__ void k_q8g32_gemv_lpr(const int8_t* __restrict__ q, const __half* __restrict__ s,
                                  const float* __restrict__ x, float* __restrict__ y,
                                  uint64_t rows, uint64_t cols) {
@@ -548,7 +550,50 @@ __global__ void k_q8g32_gemv_lpr(const int8_t* __restrict__ q, const __half* __r
   }
 #pragma unroll
   for (int off = LPR / 2; off > 0; off >>= 1) acc += __shfl_down_sync(~0ull, acc, off, LPR);
-  if (ll == 0 && live) y[row] = acc;
+  if (ll == 0 && live) {
+    if constexpr (SILU4) {
+      const float xs = acc * 0.25f;
+      y[row] = xs / (1.f + expf(-xs));
+    } else {
+      y[row] = acc;
+    }
+  }
+}
+// Chlorine, serial decode: the shared expert's gate_proj and up_proj (one wave
+// per row, the loop of k_q8g32_gemv_lpr<32> above) and k_silu_mul in one launch;
+// see the fused single-token kernels in 28_chlorine_iq.inc. Waves 0-3 take four gate rows, waves
+// 4-7 the same four up rows; the pair meets in LDS.
+__global__ void __launch_bounds__(256) k_flash_q8_gate_up_silu(
+    const int8_t* __restrict__ qg,const __half* __restrict__ sg,const int8_t* __restrict__ qu,
+    const __half* __restrict__ su,const float* __restrict__ x,float* __restrict__ hid,int rows,int cols) {
+  const uint64_t gpr=cols/32;
+  const int lane=threadIdx.x&31,wave=threadIdx.x>>5;
+  const bool up=wave>=4;
+  const int row=(int)blockIdx.x*4+(wave&3);
+  const bool live=row<rows;
+  const int8_t* qr=(up?qu:qg)+(size_t)(live?row:0)*cols;
+  const __half* sr=(up?su:sg)+(size_t)(live?row:0)*gpr;
+  float acc=0.f;
+#pragma unroll 2
+  for(uint64_t g=lane;g<gpr;g+=32) {
+    const uint4* c=(const uint4*)(qr+g*32);
+    const uint4 a0=c[0],a1=c[1];
+    const uint32_t w[8]={a0.x,a0.y,a0.z,a0.w,a1.x,a1.y,a1.z,a1.w};
+    const float* xg=x+g*32;
+    float d=0.f;
+#pragma unroll
+    for(int i=0;i<8;i++) {
+      const float4 t=*(const float4*)(xg+i*4);
+      d+=q8_b(w[i],0)*t.x+q8_b(w[i],1)*t.y+q8_b(w[i],2)*t.z+q8_b(w[i],3)*t.w;
+    }
+    acc+=__half2float(sr[g])*d;
+  }
+#pragma unroll
+  for(int off=16;off>0;off>>=1)acc+=__shfl_down_sync(~0ull,acc,off,32);
+  __shared__ float pair[8];
+  if(lane==0)pair[wave]=acc;
+  __syncthreads();
+  if(lane==0 && !up && live){const float a=pair[wave];hid[row]=a/(1.f+expf(-a))*pair[wave+4];}
 }
 template <int LPR, int TPB>
 static void q8g32_gemv_small(const int8_t* q, const __half* s, const float* x, float* y,
@@ -1428,7 +1473,7 @@ __global__ void k_axpy(float* __restrict__ acc, const float* __restrict__ y, flo
 // --- GPU router: softmax + top-k over n logits, one block. ------------------
 // out: ids[k], w[k] with w = p_e / sum(selected p) (official norm_topk_prob).
 // Batched: one block per token, ids/ws rows of 16.
-__global__ void k_router_topk(const float* __restrict__ logits, int* __restrict__ ids,
+__global__ void k_router_topk_tree(const float* __restrict__ logits, int* __restrict__ ids,
                               float* __restrict__ ws, int n, int k) {
   logits += (size_t)blockIdx.x * n;
   ids += (size_t)blockIdx.x * 16;
@@ -1480,6 +1525,84 @@ __global__ void k_router_topk(const float* __restrict__ logits, int* __restrict_
     float sw = 0.f;
     for (int j = 0; j < k; j++) sw += raw[j];
     for (int j = 0; j < k; j++) ws[j] = raw[j] / sw;
+  }
+}
+
+// Chlorine: the same selection with 12 block barriers instead of about 130.
+// k_router_topk_tree breaks ties by tree position, which works out to "among
+// equal values the smaller bit-reversed index wins". (value descending,
+// bit-reversed index ascending) is a total order, so any reduction order picks
+// the same element each round. The max is order-independent and the softmax sum
+// keeps the tree's pairing (waves w | w + 8, + 4, + 2, + 1, then lanes + 16 ..
+// + 1), so ids and weights are bit for bit the tree kernel's; mapping_gpu_test
+// compares the two, including rows full of ties. n == 512 == blockDim, k <= 16.
+__global__ void __launch_bounds__(512)
+k_router_topk(const float* __restrict__ logits, int* __restrict__ ids,
+              float* __restrict__ ws, int n, int k) {
+  logits += (size_t)blockIdx.x * n;
+  ids += (size_t)blockIdx.x * 16;
+  ws += (size_t)blockIdx.x * 16;
+  __shared__ float s_p[512];
+  __shared__ float s_wv[2][16];  // per-wave winners, double-buffered by round parity
+  __shared__ uint32_t s_wr[2][16];
+  __shared__ float s_raw[16];
+  const int t = threadIdx.x, wave = t >> 5, lane = t & 31;
+  const float v = logits[t];
+  float mx = v;
+#pragma unroll
+  for (int off = 16; off; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 32));
+  if (lane == 0) s_wv[0][wave] = mx;
+  __syncthreads();
+  mx = s_wv[0][lane & 15];
+#pragma unroll
+  for (int off = 8; off; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 32));
+  float p = expf(v - mx);
+  s_p[t] = p;
+  __syncthreads();
+  float c[16];
+#pragma unroll
+  for (int w = 0; w < 16; w++) c[w] = s_p[lane + 32 * w];
+#pragma unroll
+  for (int half = 8; half; half >>= 1)
+#pragma unroll
+    for (int w = 0; w < half; w++) c[w] += c[w + half];
+  float se = c[0];
+#pragma unroll
+  for (int off = 16; off; off >>= 1) se += __shfl_xor(se, off, 32);
+  p *= 1.f / se;
+  const uint32_t rb = __builtin_bitreverse32((uint32_t)t) >> 23;
+  for (int j = 0; j < k; j++) {
+    float bv = p;
+    uint32_t br = rb;
+#pragma unroll
+    for (int off = 16; off; off >>= 1) {
+      const float ov = __shfl_xor(bv, off, 32);
+      const uint32_t ob = __shfl_xor(br, off, 32);
+      if (ov > bv || (ov == bv && ob < br)) { bv = ov; br = ob; }
+    }
+    if (lane == 0) {
+      s_wv[j & 1][wave] = bv;
+      s_wr[j & 1][wave] = br;
+    }
+    __syncthreads();
+    bv = s_wv[j & 1][lane & 15];
+    br = s_wr[j & 1][lane & 15];
+#pragma unroll
+    for (int off = 8; off; off >>= 1) {
+      const float ov = __shfl_xor(bv, off, 32);
+      const uint32_t ob = __shfl_xor(br, off, 32);
+      if (ov > bv || (ov == bv && ob < br)) { bv = ov; br = ob; }
+    }
+    if (br == rb) p = -1e30f;
+    if (t == 0) {
+      ids[j] = (int)(__builtin_bitreverse32(br) >> 23);
+      s_raw[j] = bv;
+    }
+  }
+  if (t == 0) {
+    float sw = 0.f;
+    for (int j = 0; j < k; j++) sw += s_raw[j];
+    for (int j = 0; j < k; j++) ws[j] = s_raw[j] / sw;
   }
 }
 

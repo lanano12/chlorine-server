@@ -1826,6 +1826,27 @@ __global__ void __launch_bounds__(128)
   }
 }
 
+// Chlorine: union lists for groups inside the dense prefix, so k_qsa_wmma_u can
+// replace the per-row dense kernel there. A dense query sees every earlier key:
+// all blocks before the group's own block for all four queries (mask 0xFFFF),
+// then the own block, which query 3 sees whole (0xF000) and queries 0..2 see
+// through the kernel's causal rule (slot <= query). Padded to a multiple of 4
+// like k_qsa_union_merge. g0 = absolute first token of group 0 (4-aligned).
+__global__ void __launch_bounds__(128)
+    k_qsa_union_dense(uint16_t* __restrict__ ublk, uint16_t* __restrict__ umask,
+                      int* __restrict__ ucount, int cap, int g0) {
+  const int g = blockIdx.x;
+  const int own = (g0 >> 2) + g;
+  const int padded = (own + 4) & ~3;  // own + 1 entries, rounded up
+  uint16_t* ob = ublk + (size_t)g * cap;
+  uint16_t* om = umask + (size_t)g * cap;
+  for (int i = threadIdx.x; i < padded; i += 128) {
+    ob[i] = i <= own ? (uint16_t)i : (uint16_t)0xFFFFu;
+    om[i] = i < own ? (uint16_t)0xFFFFu : i == own ? (uint16_t)0xF000u : (uint16_t)0;
+  }
+  if (threadIdx.x == 0) ucount[g] = padded;
+}
+
 // 并集 attention：grid (ngroups, 2)，256 线程 = 8 warp。结构同参考
 // qsa3_attn_kernel：warp w 持有全部 48 行的 [32w,+32) 维 Q 切片（寄存器常驻
 // bf16 A... 实为 B 操作数：wmma(K, Q) 得 Sᵀ），QK 跨 warp 经 part[] LDS 归约；
