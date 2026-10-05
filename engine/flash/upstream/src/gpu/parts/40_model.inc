@@ -2888,23 +2888,39 @@ struct GpuModel {
           // 并集路径：[ga, ge) 内的 4 对齐完整组走 merge + k_qsa_wmma_u，
           // 两侧 ragged 边缘回退逐 token 的 k_qsa_wmma<true>
           const int ga = (first_abs + 3) & ~3;
-          const int ge = (base + P) & ~3;
-          if (ge - ga >= 4) {
-            const int ngroups = (ge - ga) >> 2;
-            k_qsa_union_merge<<<ngroups, 128, 0, g_str>>>(
-                d_iselected, ga, d_ublk, d_umask, d_ucount, QSA_UCAP, base);
-            k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
-                d_ucount, QSA_UCAP, ga, base);
-          }
-          if (ga > first_abs)
-            k_qsa_wmma<true><<<dim3(ga - first_abs, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel,
-                first_abs, base);
-          if (base + P > ge)
-            k_qsa_wmma<true><<<dim3(base + P - ge, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, ge,
+          // Chlorine: union block ids are uint16 and 0xFFFF is the padding value,
+          // so the group whose own block is 65535 (tokens 262,140..262,143, the
+          // last four of the native context) stays on the per-token kernel.
+          const int ge_all = (base + P) & ~3;
+          const int ge = std::min(ge_all, 65535 * 4);
+          if (ge < ge_all && ge - ga < 4) {
+            // the batch reaches only that last group
+            k_qsa_wmma<true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
+                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, first_abs,
                 base);
+          } else {
+            if (ge - ga >= 4) {
+              const int ngroups = (ge - ga) >> 2;
+              k_qsa_union_merge<<<ngroups, 128, 0, g_str>>>(
+                  d_iselected, ga, d_ublk, d_umask, d_ucount, QSA_UCAP, base);
+              k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
+                  d_ucount, QSA_UCAP, ga, base);
+            }
+            if (ga > first_abs)
+              k_qsa_wmma<true><<<dim3(ga - first_abs, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel,
+                  first_abs, base);
+            // Chlorine fix: the kernel reads selection row blockIdx.x of the
+            // pointer it is given, so the tail needs the rows of tokens ge.. and
+            // not `sel` (the rows of first_abs..). As imported, a batch that
+            // ended off a 4-token boundary gave its last one to three tokens
+            // the block lists of the first sparse tokens.
+            if (base + P > ge)
+              k_qsa_wmma<true><<<dim3(base + P - ge, 2), 256, 0, g_str>>>(
+                  d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24,
+                  sel + (size_t)(ge - first_abs) * 512, ge, base);
+          }
         }
         else if (qsa_wmma6 && vc_transposed)
           k_qsa_wmma6<<<dim3(nsparse, 2), 128, 0, g_str>>>(
