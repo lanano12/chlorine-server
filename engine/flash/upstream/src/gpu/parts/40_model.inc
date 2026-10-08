@@ -1511,7 +1511,7 @@ struct GpuModel {
     float *pw, *pairs;
     MoeTile* tiles;
     __half *x16, *hid;
-    int max_tiles, tile = 64;
+    int max_tiles, tile = 64, dn_tile = 64;
     if (P == 1) {
       k_moe_gg_route1<<<1, 64, 0, g_str>>>(topids, topw, 1, k, 16, d_gg_tok, d_gg_pw,
                                            d_gg_pid, d_gg_tiles, d_gg_nt);
@@ -1537,6 +1537,11 @@ struct GpuModel {
       }();
       const bool lut_up = g.tgu == 20 || g.tgu == 21 || g.tgu == 23;
       tile = (lut_up && g.tdn == 20) ? lut_tile : 64;
+      // Down is IQ4NL and fits a 192-slot tile. Gate/up stays at 160: a 192-slot
+      // gate/up block is one per compute unit and was no faster. The kernels run
+      // in sequence, so the down pass rebuilds this tile buffer. BN does not
+      // change a (row, token) result.
+      dn_tile = (tile == 160 && g.tdn == 20) ? 192 : tile;
       k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, tile);
       tokidx = d_tokidx, pairids = d_pairids, ntiles = d_moentiles, pw = d_pweight;
       tiles = d_moetiles, x16 = (__half*)d_xbf16b, hid = (__half*)d_hidb, pairs = d_guvb;
@@ -1550,12 +1555,16 @@ struct GpuModel {
                    g_str, tile))
       throw std::runtime_error("moe_gguf: unsupported expert type");
     if (sp) sp_mark("moe.up");
+    if (dn_tile != tile) {
+      k_moe_tiles<<<1, 512, 0, g_str>>>(d_eoff, d_moetiles, d_moentiles, E, dn_tile);
+      max_tiles = (P * k + dn_tile - 1) / dn_tile + E;
+    }
     // Chlorine, opt-in: F16 pair rows halve the P*k x d traffic between the down
     // kernel and the reduce. It rounds every pair row to F16 before the weighted
     // sum, so it changes arithmetic and belongs to the fast mode.
     static const bool pairs_f16_env = getenv("GDEC_FLASH_PAIRS_F16") != nullptr;
     const bool pairs_f16 = pairs_f16_env && P > 1 && g.tdn == 20;
-    if (!flash_moe_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str, tile,
+    if (!flash_moe_down(g.tdn, g.down, hid, tiles, ntiles, max_tiles, pairs, d, mid, g_str, dn_tile,
                         pairs_f16))
       throw std::runtime_error("moe_gguf: unsupported expert type");
     if (sp) sp_mark("moe.down");
