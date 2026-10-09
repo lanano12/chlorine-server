@@ -96,7 +96,7 @@ if(FLASH_BUILD_API)
 endif()
 if(FLASH_BUILD_GPU)
   file(GLOB_RECURSE FLASH_TEST_DEPS CONFIGURE_DEPENDS tests/*.hpp)
-  foreach(check IN ITEMS moe_test index_fast_test gdn_verify_test gemv_test ple_test mapping_gpu_test index_reference_gpu_test attention_reference_gpu_test)
+  foreach(check IN ITEMS moe_test index_fast_test gdn_verify_test gemv_test ple_test mapping_gpu_test index_reference_gpu_test attention_reference_gpu_test attention_union_gpu_test)
     add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${check}
       COMMAND ${HIPCC_EXECUTABLE} --offload-arch=gfx1151 -O3 -Werror ${FLASH_SEMANTIC_FLAGS}
         -I${CMAKE_CURRENT_SOURCE_DIR}/upstream/src/gpu
@@ -112,15 +112,25 @@ if(FLASH_BUILD_GPU)
       set_tests_properties(flash-moe-${format}-${rows} PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
     endforeach()
   endforeach()
+  # Production tiling: 160-slot gate/up tiles and a 192-slot down pass rebuilt
+  # from the same routing, full and partial tiles, bit-identical to 64 slots.
+  foreach(format IN ITEMS iq3s iq4xs iq4nl)
+    foreach(rows IN ITEMS 65 2048)
+      add_test(NAME flash-moe-${format}-${rows}-tile160-down192 COMMAND ${CMAKE_CURRENT_BINARY_DIR}/moe_test
+        --synth ${format} --E 10 --P ${rows} --tile 160 --dn-tile 192 --iters 1 --check-experts 2)
+      set_tests_properties(flash-moe-${format}-${rows}-tile160-down192 PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+    endforeach()
+  endforeach()
   add_test(NAME flash-gemv COMMAND ${CMAKE_CURRENT_BINARY_DIR}/gemv_test)
   add_test(NAME flash-index COMMAND ${CMAKE_CURRENT_BINARY_DIR}/index_fast_test --quick)
   add_test(NAME flash-gdn COMMAND ${CMAKE_CURRENT_BINARY_DIR}/gdn_verify_test)
   add_test(NAME flash-mapping-gpu COMMAND ${CMAKE_CURRENT_BINARY_DIR}/mapping_gpu_test)
   add_test(NAME flash-index-reference-gpu COMMAND ${CMAKE_CURRENT_BINARY_DIR}/index_reference_gpu_test)
   add_test(NAME flash-attention-reference-gpu COMMAND ${CMAKE_CURRENT_BINARY_DIR}/attention_reference_gpu_test)
+  add_test(NAME flash-attention-union-gpu COMMAND ${CMAKE_CURRENT_BINARY_DIR}/attention_union_gpu_test)
   add_test(NAME flash-ple-gpu COMMAND ${CMAKE_CURRENT_BINARY_DIR}/ple_test
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ple_reference.json)
-  set_tests_properties(flash-index flash-gdn flash-gemv flash-ple-gpu flash-mapping-gpu flash-index-reference-gpu flash-attention-reference-gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+  set_tests_properties(flash-index flash-gdn flash-gemv flash-ple-gpu flash-mapping-gpu flash-index-reference-gpu flash-attention-reference-gpu flash-attention-union-gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
 endif()
 if(FLASH_BUILD_API)
   add_executable(flash-tok upstream/src/api/tokenizer.cpp upstream/src/api/tok_cli.cpp)

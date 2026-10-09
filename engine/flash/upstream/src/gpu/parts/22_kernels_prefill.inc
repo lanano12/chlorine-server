@@ -1685,30 +1685,39 @@ __global__ void __launch_bounds__(128)
     }
 }
 
-// --- GDEC_QSA_UNION: 4-query 块并集 WMMA 稀疏 prefill attention ---------------
-// 移植自 llama.cpp-strix-halo qsa.cu 的 qsa3 rows/merge/attn（同模型、同 GPU
-// 验证过），适配引擎数据布局。4 个连续（4 对齐）稀疏 token 的 top-512 块列表
-// 由 k_qsa_union_merge 合成并集（实测重叠 ~2/3，K/V gather 量约 ÷3），
-// k_qsa_wmma_u 一个 block 处理 1 组 × 1 个 KV 头：48 个 Q 行（4 token x 12 头
-// = 3 个 16 行 WMMA tile）共享同一条 K/V 流。
-// 与参考的差异：
-//  - bf16（参考是 f16），fragment 布局以 k_qsa_wmma 注释的本机实测为准
-//    （参考的 key 交错/掩码映射与该布局自洽，照搬）；
-//  - K 走行主序 bf16 cache 按键 gather（同 k_qsa_wmma），V 走 vct 转置
-//    cache（[block][kvh][dim][slot]，与参考 packed pv 同构）；不上 packed K；
-//  - 引擎选择列表是块粒度且升序、无无效项（稀疏 token n>512），merge 直接
-//    4 路归并块号，整块快路径退化为常数；省掉参考的 rows 排序 kernel；
-//  - 参考的尾部 key 由 mask 张量表达；引擎的 dense 尾部 = 组内自身块的
-//    slot 0..qi（qi<3），attn 内对自身块做因果覆盖（slot cc 对 query qi<3
-//    可见 iff cc <= qi；qi=3 无尾部，仅靠 mask），零额外 K/V 流量；自身块
-//    若未被 token g+3 选中则由 merge 补登（mask=0，只剩因果覆盖生效，
-//    语义与逐 token 路径一致）。
-//  - scale 在跨 warp 归约后乘（1/16，与 k_qsa_wmma 一致），softmax 用 __expf。
-#define QSA_UCAP 2052  // 每组并集容量（块）：4x512 + 自身块补登，pad 到 4 倍数
+// --- GDEC_QSA_UNION: 4-query block-union WMMA sparse prefill attention ----------
+// Ported from the qsa3 rows/merge/attn kernels of llama.cpp-strix-halo's qsa.cu
+// (validated on the same model and GPU) and adapted to this engine's layouts. The
+// top-512 block lists of four consecutive (4-aligned) sparse tokens are merged
+// into one union by k_qsa_union_merge (measured overlap about 2/3, so the K/V
+// gather volume falls by about 3x); k_qsa_wmma_u handles one group x one KV head
+// per block: 48 Q rows (4 tokens x 12 heads = three 16-row WMMA tiles) share one
+// K/V stream.
+// Differences from the reference:
+//  - bf16 (the reference is f16); the fragment layout follows the measured layout
+//    in the k_qsa_wmma comment (the reference's key interleave and mask mapping
+//    are consistent with that layout and are kept as they are);
+//  - K is gathered by key from the row-major bf16 cache (as in k_qsa_wmma); V
+//    comes from the transposed vct cache ([block][kvh][dim][slot], the same shape
+//    as the reference's packed pv); no packed K;
+//  - the engine's selection lists are block-granular, ascending and free of
+//    invalid entries (sparse tokens have n > 512), so merge is a plain 4-way merge
+//    of block ids and the whole-block fast path becomes a constant; the
+//    reference's row-sorting kernel is dropped;
+//  - the reference expresses tail keys with a mask tensor; here the dense tail is
+//    slots 0..qi of the group's own block (qi < 3), and attn applies the causal
+//    rule to the own block (slot cc is visible to query qi < 3 iff cc <= qi; qi = 3
+//    has no tail and relies on the mask alone), at no extra K/V traffic. If token
+//    g+3 did not select the own block, merge appends it with mask 0, so only the
+//    causal rule applies, matching the per-token path;
+//  - the scale is applied after the cross-warp reduction (1/16, as in k_qsa_wmma);
+//    softmax uses __expf.
+#define QSA_UCAP 2052  // union capacity per group, in blocks: 4 x 512 selections, plus the group's own block when it is missing, padded to a multiple of 4
 
-// 4 条升序 top-512 块号列表 -> 并集 + 每 query 有效性掩码（整块 0xF）。
-// 128 lanes：lane 负责块号子区间（row0 分位数划分，真实负载均衡）；两遍归并
-// （pass1 计数 + Hillis-Steele 前缀和，pass2 写出），pad 0xFFFF。
+// Four ascending top-512 block-id lists -> their union plus a per-query validity
+// mask (a whole block is 0xF). 128 lanes: each lane owns a sub-range of block ids
+// (row 0's quantiles, which balances the real load); two merge passes (pass 1
+// counts, then a Hillis-Steele prefix sum; pass 2 writes), padded with 0xFFFF.
 __global__ void __launch_bounds__(128)
     k_qsa_union_merge(const int* __restrict__ sel, int g0,
                       uint16_t* __restrict__ ublk, uint16_t* __restrict__ umask,
@@ -1716,10 +1725,10 @@ __global__ void __launch_bounds__(128)
   __shared__ int rows_s[4][512];
   __shared__ int scan_s[128];
   const int lane = threadIdx.x, g = blockIdx.x;
-  const int t0 = g0 + 4 * g;  // 组首 token（绝对，4 对齐）
+  const int t0 = g0 + 4 * g;  // first token of the group (absolute, 4-aligned)
 #pragma unroll
   for (int qi = 0; qi < 4; ++qi) {
-    // sel 行号 = 绝对 token - sbase（A1b：d_iselected 按 batch 局部行存放）
+    // sel row = absolute token - sbase (A1b: d_iselected holds batch-local rows)
     const int* src = sel + (size_t)(t0 + qi - sbase) * 512;
     for (int j = lane; j < 512; j += 128) rows_s[qi][j] = src[j];
   }
@@ -1728,7 +1737,7 @@ __global__ void __launch_bounds__(128)
   int kmax = rows_s[0][511];
 #pragma unroll
   for (int qi = 1; qi < 4; ++qi) kmax = max(kmax, rows_s[qi][511]);
-  // lane 的块号子区间 [lo, hi)：row0 的分位数
+  // this lane's block-id sub-range [lo, hi): quantiles of row 0
   const int lo = lane == 0 ? 0 : rows_s[0][4 * lane];
   const int hi = lane == 127 ? kmax + 1 : rows_s[0][4 * (lane + 1)];
   int p[4], pe[4];
@@ -1747,7 +1756,7 @@ __global__ void __launch_bounds__(128)
     }
     pe[qi] = a;
   }
-  // pass 1：计数（p[] 保留给 pass 2）
+  // pass 1: count (p[] is kept for pass 2)
   int n = 0;
   {
     int pp[4], head[4];
@@ -1783,7 +1792,7 @@ __global__ void __launch_bounds__(128)
   int o = scan_s[lane] - n;
   uint16_t* ob = ublk + (size_t)g * cap;
   uint16_t* om = umask + (size_t)g * cap;
-  // pass 2：写出（整块 -> 该 query 4 slot 全置）
+  // pass 2: write (a whole block sets all 4 slots of that query)
   {
     int head[4];
 #pragma unroll
@@ -1809,9 +1818,10 @@ __global__ void __launch_bounds__(128)
   }
   if (lane == 127) {
     int t = total;
-    // 防御：自身块必须落在并集里（qi<3 的 dense 尾部挂在它的 slot 上）。
-    // 正常总被 token g+3 选中（row3 末位即 own）；万一缺失则补登，
-    // mask=0：qi=3 不可见它（与逐 token 路径一致），qi<3 靠因果覆盖。
+    // Defence: the own block must be in the union (the dense tail of qi < 3 hangs
+    // on its slots). Normally token g+3 selects it (the last entry of row 3 is
+    // own); if it is missing, append it with mask 0: qi = 3 cannot see it (as on
+    // the per-token path) and qi < 3 rely on the causal rule.
     if (rows_s[3][511] != own) {
       ob[t] = (uint16_t)own;
       om[t] = 0;
@@ -1847,13 +1857,15 @@ __global__ void __launch_bounds__(128)
   if (threadIdx.x == 0) ucount[g] = padded;
 }
 
-// 并集 attention：grid (ngroups, 2)，256 线程 = 8 warp。结构同参考
-// qsa3_attn_kernel：warp w 持有全部 48 行的 [32w,+32) 维 Q 切片（寄存器常驻
-// bf16 A... 实为 B 操作数：wmma(K, Q) 得 Sᵀ），QK 跨 warp 经 part[] LDS 归约；
-// warp 0..2 是 owner（行 16w+r），负责 online softmax 并把 P 量化 bf16 经
-// ptile LDS 回转成 PV 的 B 操作数；PV 的 A = V（vct 转置 cache，4 slot 一次
-// 64-bit 读），C 的行是 perm 后的维度、列是 Q 行。每 chunk 恰 2 次
-// __syncthreads()，K 描述符与 fragment 软件流水预取。
+// Union attention: grid (ngroups, 2), 256 threads = 8 warps. Same structure as
+// the reference qsa3_attn_kernel: warp w holds the [32w, +32) dim slice of all
+// 48 Q rows in registers as bf16 (nominally the A operand, in practice B:
+// wmma(K, Q) gives S^T); QK is reduced across warps through the part[] LDS;
+// warps 0..2 are the owners (row 16w + r), run the online softmax and quantise
+// P to bf16, which goes through the ptile LDS to become the B operand of PV;
+// PV's A operand is V (the transposed vct cache, 4 slots per 64-bit read), and
+// C has the permuted dimensions as rows and the Q rows as columns. Exactly two
+// __syncthreads() per chunk; K descriptors and fragments are software-pipelined.
 __global__ void __launch_bounds__(256)
     k_qsa_wmma_u(const float* __restrict__ q, const uint16_t* __restrict__ kc,
                  const uint16_t* __restrict__ vct, float* __restrict__ out,
@@ -1872,10 +1884,10 @@ __global__ void __launch_bounds__(256)
   const uint16_t* gmsk = umask + (size_t)g * cap;
   const int nchunks = ucount[g] >> 2;
   const int own_blk = (g0 >> 2) + g;
-  const int tok0 = g0 + 4 * g - kbase;  // 组首 token 的 batch 行
+  const int tok0 = g0 + 4 * g - kbase;  // batch row of the group's first token
   const int hqk = hq / hkv;             // 12
 
-  // Q stage：warp w 负责全部 48 行的 [32w,+32) 维切片（fp32 -> bf16 RNE）
+  // Q stage: warp w takes the [32w, +32) dim slice of all 48 rows (fp32 -> bf16 RNE)
   uint16_t* stage = reinterpret_cast<uint16_t*>(&part[0][0][0]) + w * (48 * 32);
 #pragma unroll
   for (int c = 0; c < 12; ++c) {
@@ -1904,7 +1916,7 @@ __global__ void __launch_bounds__(256)
     for (int t = 0; t < 2; ++t)
 #pragma unroll
       for (int e = 0; e < 8; ++e) O[i][t][e] = 0.f;
-  float m = -1e30f, l = 0.f;  // owner 状态（w<3）：行 16w+r
+  float m = -1e30f, l = 0.f;  // owner state (w < 3): row 16w + r
   const int own_qi = (16 * w + r) / 12;
 
   auto load_desc = [&](const int c, uint32_t& b01, uint32_t& b23, uint32_t& m01,
@@ -1917,9 +1929,10 @@ __global__ void __launch_bounds__(256)
     const uint32_t v = (j < 2 ? b01 : b23) >> (16 * (j & 1)) & 0xFFFFu;
     return v == 0xFFFFu ? 0 : (int)v;
   };
-  // K：行主序 bf16 cache 按键 gather；lane r 持有 chunk 内第 r 个 key 的
-  // [32w,+32) 维（硬件 A 布局实际取 lane 2r/17+2(r-8) -> key 交错
-  // 0,2,4,...,14,1,3,...,15，掩码侧按同一 perm 映射）。
+  // K: gathered by key from the row-major bf16 cache; lane r holds the [32w, +32)
+  // dims of the r-th key of the chunk (the hardware A layout reads lanes 2r and
+  // 17 + 2(r - 8), so the keys interleave as 0,2,4,...,14,1,3,...,15; the mask
+  // side uses the same permutation).
   auto load_k = [&](const uint32_t b01, const uint32_t b23, qw_shortx16* kf) {
     const int src = 4 * blk_of(b01, b23, r >> 2) + (r & 3);
     const uint16_t* krow = kc + ((size_t)src * hkv + kvh) * dh + w * 32;
@@ -1945,7 +1958,7 @@ __global__ void __launch_bounds__(256)
       for (int t = 0; t < 2; ++t)
         sc[i] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(kf[t], qf[i][t], sc[i]);
     }
-    // V：vct 转置 cache，lane r 持有维 32w+16t+r 的 4 块 x 4 slot（16 key）
+    // V: the transposed vct cache; lane r holds dim 32w + 16t + r for 4 blocks x 4 slots (16 keys)
     qw_shortx16 vf[2];
     {
       const uint16_t* vb[4];
@@ -1969,7 +1982,7 @@ __global__ void __launch_bounds__(256)
         memcpy(&vf[t], tmp, 32);
       }
     }
-    // 预取下一 chunk 的描述符与 K fragment
+    // prefetch the next chunk's descriptors and K fragments
     uint32_t nb01 = 0, nb23 = 0, nm01 = 0, nm23 = 0;
     qw_shortx16 kfn[2];
     if (c + 1 < nchunks) {
@@ -1988,7 +2001,7 @@ __global__ void __launch_bounds__(256)
     }
     __syncthreads();
     if (w < 3) {
-      // owner：归约 8 个 warp 的 32 维 partial -> 全 256 维 Sᵀ，再 softmax
+      // owner: reduce the 8 warps' 32-dim partials into the full 256-dim S^T, then softmax
       float scf[8];
 #pragma unroll
       for (int e = 0; e < 8; ++e) scf[e] = 0.f;
@@ -2003,16 +2016,17 @@ __global__ void __launch_bounds__(256)
           scf[4] += b.x; scf[5] += b.y; scf[6] += b.z; scf[7] += b.w;
         }
       }
-      // 有效性 + 自身块因果覆盖（elem e -> 块 j=e>>1、slot cc=2*(e&1)+hi，
-      // 与硬件 A 布局的 key 交错一致）
+      // validity plus the own block's causal rule (elem e -> block j = e >> 1,
+      // slot cc = 2 * (e & 1) + hi, matching the key interleave of the hardware A layout)
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
         scf[e] *= 0.0625f;  // 1/sqrt(256)
         const int j = e >> 1, cc = 2 * (e & 1) + hi;
         const uint32_t mk = ((j < 2 ? m01 : m23) >> (16 * (j & 1))) & 0xFFFFu;
         bool kv = (mk >> (own_qi * 4 + cc)) & 1u;
-        // 自身块因果覆盖：qi<3 的 dense 尾部 = 自身块 slot 0..qi（恒可见）；
-        // qi=3 无尾部，自身块仅在真被选中（mask 0xF000）时可见
+        // own-block causal rule: for qi < 3 the dense tail is own-block slots 0..qi
+        // (always visible); qi = 3 has no tail, so the own block is visible only when
+        // it was really selected (mask 0xF000)
         if (own_qi < 3 && blk_of(b01, b23, j) == own_blk && cc <= own_qi)
           kv = true;
         if (!kv) scf[e] = -1e30f;
@@ -2022,7 +2036,7 @@ __global__ void __launch_bounds__(256)
       for (int e = 1; e < 8; ++e) mloc = fmaxf(mloc, scf[e]);
       mloc = fmaxf(mloc, __shfl_xor_sync(~0ull, mloc, 16));
       const float mnew = fmaxf(m, mloc);
-      const float alpha = __expf(m - mnew);  // 全掩码 chunk：m==mnew -> 1
+      const float alpha = __expf(m - mnew);  // fully masked chunk: m == mnew -> 1
       float p[8], ls = 0.f;
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
@@ -2032,7 +2046,7 @@ __global__ void __launch_bounds__(256)
       ls += __shfl_xor_sync(~0ull, ls, 16);
       l = l * alpha + ls;
       m = mnew;
-      // P 量化 bf16 并按自然 key 序摆进 ptile（WMMA C 布局回不去 A，LDS 回转）
+      // quantise P to bf16 and lay it into ptile in natural key order (the WMMA C layout cannot feed A; LDS round trip)
       uint32_t pp[4], po[4];
 #pragma unroll
       for (int e2 = 0; e2 < 4; ++e2) {
@@ -2089,7 +2103,7 @@ __global__ void __launch_bounds__(256)
 
   if (w < 3 && hi == 0) l_s[16 * w + r] = l;
   __syncthreads();
-  // 输出：每 tile 先经 LDS 摆成 [16 行 x 32 维] fp32，再 float4 合并写全局
+  // output: each tile goes through LDS as [16 rows x 32 dims] fp32, then merged float4 writes to global
   float* ostage = reinterpret_cast<float*>(&part[0][0][0]) + w * (16 * 32);
 #pragma unroll
   for (int i = 0; i < 3; ++i) {

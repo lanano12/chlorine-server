@@ -7,6 +7,9 @@
 //   moe_lut_test --synth iq3s|iq4nl|iq4xs [--E N]       synthetic GGUF IQ4 blocks
 //                                                  (gate/up that type, down IQ4_NL)
 //   common: [--P N] [--iters N] [--check-experts N] [--seed S] [--tol X]
+//           [--tile N] [--dn-tile N]  slots per tile for gate/up and for down
+//           (production: 160 and 192; the down list is rebuilt from the same
+//           routing, as the engine does with k_moe_tiles)
 //
 // Routing: random top-10 (distinct experts per token, mildly skewed), like
 // tools/moe_gguf_test.cu. Correctness: outputs are pre-filled with NaN and
@@ -103,7 +106,7 @@ int main(int argc, char** argv) {
     fprintf(stderr,"SKIP: HIP device unavailable; no GPU correctness claim\n"); return 77;
   }
   std::string hgn_path, synth;
-  int layer = 0, P = 2048, iters = 10, check_e = 8, topk = 10, E_synth = 128, tile = 64;
+  int layer = 0, P = 2048, iters = 10, check_e = 8, topk = 10, E_synth = 128, tile = 64, dn_tile = 0;
   unsigned seed = 1;
   double tol = 1e-2;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -115,6 +118,7 @@ int main(int argc, char** argv) {
     else if (a == "--E") E_synth = atoi(argv[i + 1]);
     else if (a == "--iters") iters = atoi(argv[i + 1]);
     else if (a == "--tile") tile = atoi(argv[i + 1]);
+    else if (a == "--dn-tile") dn_tile = atoi(argv[i + 1]);
     else if (a == "--check-experts") check_e = atoi(argv[i + 1]);
     else if (a == "--seed") seed = (unsigned)atoi(argv[i + 1]);
     else if (a == "--tol") tol = atof(argv[i + 1]);
@@ -124,6 +128,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "usage: %s (--hgn W4B.hgn [--layer L] | --synth iq3s|iq4nl|iq4xs [--E N]) [--P N] ...\n", argv[0]);
     return 2;
   }
+  if (dn_tile == 0) dn_tile = tile;
   std::mt19937 rng(seed);
 
   int D, MID, E, t_gu, t_dn_type;
@@ -180,8 +185,8 @@ int main(int argc, char** argv) {
     deq_gate = [&, rbg, tg](int e, int r, float* o) { gguf::dequant_row(tg, hg.data() + ((size_t)e * MID + r) * rbg, o, D); };
     deq_up = [&, rbg, tg](int e, int r, float* o) { gguf::dequant_row(tg, hu.data() + ((size_t)e * MID + r) * rbg, o, D); };
     deq_down = [&, rbd](int e, int r, float* o) { gguf::dequant_row(gguf::IQ4_NL, hd.data() + ((size_t)e * D + r) * rbd, o, MID); };
-    printf("synthetic: gate/up %s [%d][%d][%d], down IQ4_NL [%d][%d][%d], P=%d top%d\n",
-           gguf::type_name(t_gu), E, MID, D, E, D, MID, P, topk);
+    printf("synthetic: gate/up %s [%d][%d][%d], down IQ4_NL [%d][%d][%d], P=%d top%d tile %d down %d\n",
+           gguf::type_name(t_gu), E, MID, D, E, D, MID, P, topk, tile, dn_tile);
   }
 
   // routing (mild skew: expert popularity ~ 1/(1+e/64))
@@ -215,6 +220,13 @@ int main(int argc, char** argv) {
     for (int r = eoff[e]; r < eoff[e + 1]; r += tile) tiles.push_back({e, r, std::min(tile, eoff[e + 1] - r)});
   const int ntiles = (int)tiles.size();
   const int max_tiles = (npairs + tile - 1) / tile + E;  // engine's grid bound
+  // Down pass tiles: the engine rebuilds the tile list for its down tile size
+  // (k_moe_tiles with dn_tile) from the same per-expert offsets.
+  std::vector<MoeTile> tiles_dn;
+  for (int e = 0; e < E; e++)
+    for (int r = eoff[e]; r < eoff[e + 1]; r += dn_tile) tiles_dn.push_back({e, r, std::min(dn_tile, eoff[e + 1] - r)});
+  const int ntiles_dn = (int)tiles_dn.size();
+  const int max_tiles_dn = (npairs + dn_tile - 1) / dn_tile + E;
 
   std::normal_distribution<float> nd(0.f, 1.f);
   std::vector<__half> xh((size_t)P * D);
@@ -224,6 +236,8 @@ int main(int argc, char** argv) {
   float* d_pairs;
   int *d_tok, *d_nt;
   MoeTile* d_tiles;
+  MoeTile* d_tiles_dn;
+  int* d_nt_dn;
   CK(hipMalloc(&d_x, xh.size() * 2));
   CK(hipMalloc(&d_hid, (size_t)npairs * MID * 2));
   CK(hipMalloc(&d_pairs, (size_t)npairs * D * 4));
@@ -234,6 +248,10 @@ int main(int argc, char** argv) {
   CK(hipMemcpy(d_tok, tokidx.data(), npairs * 4, hipMemcpyHostToDevice));
   CK(hipMemcpy(d_nt, &ntiles, 4, hipMemcpyHostToDevice));
   CK(hipMemcpy(d_tiles, tiles.data(), ntiles * sizeof(MoeTile), hipMemcpyHostToDevice));
+  CK(hipMalloc(&d_tiles_dn, (size_t)max_tiles_dn * sizeof(MoeTile)));
+  CK(hipMalloc(&d_nt_dn, 4));
+  CK(hipMemcpy(d_nt_dn, &ntiles_dn, 4, hipMemcpyHostToDevice));
+  CK(hipMemcpy(d_tiles_dn, tiles_dn.data(), ntiles_dn * sizeof(MoeTile), hipMemcpyHostToDevice));
   CK(hipMemset(d_hid, 0xFF, (size_t)npairs * MID * 2));  // NaN
   CK(hipMemset(d_pairs, 0xFF, (size_t)npairs * D * 4));  // NaN
 
@@ -244,7 +262,7 @@ int main(int argc, char** argv) {
     }
   };
   auto run_dn = [&]() {
-    if (!((t_dn_type==moelut::kQ4CP) ? moe_lut_down(t_dn_type,pdn,d_hid,d_tiles,d_nt,max_tiles,d_pairs,D,MID,0) : flash_moe_down(t_dn_type,pdn.w,d_hid,d_tiles,d_nt,max_tiles,d_pairs,D,MID,0,tile))) {
+    if (!((t_dn_type==moelut::kQ4CP) ? moe_lut_down(t_dn_type,pdn,d_hid,d_tiles,d_nt,max_tiles,d_pairs,D,MID,0) : flash_moe_down(t_dn_type,pdn.w,d_hid,d_tiles_dn,d_nt_dn,max_tiles_dn,d_pairs,D,MID,0,dn_tile))) {
       fprintf(stderr, "moe_lut_down: unsupported\n");
       exit(2);
     }
@@ -261,9 +279,10 @@ int main(int argc, char** argv) {
   CK(hipMemcpy(hid.data(), d_hid, hid.size() * 2, hipMemcpyDeviceToHost));
   CK(hipMemcpy(pairs.data(), d_pairs, pairs.size() * 4, hipMemcpyDeviceToHost));
   bool ok = true;
-  if (tile != 64) {
+  if (tile != 64 || dn_tile != 64) {
     // A larger tile only shares the weight decode between more slots: both outputs
-    // must match the 64-slot tiling bit for bit.
+    // must match the 64-slot tiling bit for bit, including the production pairing
+    // of a 160-slot gate/up pass with a 192-slot down pass over the same routing.
     std::vector<MoeTile> t64;
     for (int e = 0; e < E; e++)
       for (int r = eoff[e]; r < eoff[e + 1]; r += 64) t64.push_back({e, r, std::min(64, eoff[e + 1] - r)});
@@ -292,8 +311,8 @@ int main(int argc, char** argv) {
     size_t dh = 0, dp = 0;
     for (size_t i = 0; i < hid.size(); i++) dh += std::memcmp(&hid[i], &hid64[i], 2) != 0;
     for (size_t i = 0; i < pairs.size(); i++) dp += std::memcmp(&pairs[i], &pairs64[i], 4) != 0;
-    printf("tile %d vs 64: hid bit_diffs %zu / %zu, pairs bit_diffs %zu / %zu\n", tile, dh, hid.size(), dp,
-           pairs.size());
+    printf("tile %d (down %d) vs 64: hid bit_diffs %zu / %zu, pairs bit_diffs %zu / %zu\n", tile, dn_tile, dh,
+           hid.size(), dp, pairs.size());
     if (dh || dp) ok = false;
     CK(hipFree(d_t64)); CK(hipFree(d_n64)); CK(hipFree(d_hid64)); CK(hipFree(d_pairs64));
   }
