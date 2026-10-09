@@ -145,6 +145,7 @@
 #include "parts/00_platform.inc"
 #include "../../../ple_contract.hpp"
 #include "../../../mapping_contract.hpp"
+#include "../../../qsa_union_partition.hpp"
 #include "../../../trace.hpp"
 #include "parts/05_config.inc"
 #include "parts/06_memstats.inc"

@@ -50,6 +50,10 @@ Diagnostics: `GDEC_PHASE=3` prints named sub-layer prefill times per chunk, `GDE
 
 ## Runtime boundaries
 
+**Unqualified verification experiments (2026-10-09).** `GDEC_FLASH_VERIFY_F32=1` selects the serial fixed-order F32 GEMV for all batches of 1–9 rows, including prompt tails and the final mixer; larger batches retain their existing paths. It rejects `GDEC_GR_BF16`, which does not maintain the required FP32 residual inputs. `GDEC_FLASH_VERIFY_NO_FINAL=1` skips the discarded single-row final head before MTP/chain batch logits. Both default off. The expanded `mapping_gpu_test` requires zero bit differences for the F32 route but has only compiled, not executed on device in the implementation session. Neither switch proves complete verifier identity or qualifies drafting. The parent [handoff](../../../variant-flash/IMPLEMENTATION-2026-10-09.md) records build/test evidence and the remaining recurrent/rollback checks.
+
+Union-attention dispatch also now uses `qsa_union_partition.hpp` to handle short unaligned continuations without out-of-range query or selection rows. `flash-qsa-union-partition` checks exact interval coverage and the native-context padding boundary; it does not replace GPU output checks.
+
 Use the parent `variant-flash/bench/serve.py` supervisor. It defaults to preflight only, clears inherited experimental settings, estimates memory admission, checks the two ports and other model processes, and owns only its own children. Add `--execute` on a device-enabled host to start it; Ctrl-C stops both children. The memory allowance is conservative, not a measured peak. See [`variant-flash/bench/README.md`](../../../variant-flash/bench/README.md).
 
 Default engine: `127.0.0.1:8742`. Default API: `127.0.0.1:8733`. Model id: `chlorine-qwen3.8-flash-next`. Serial greedy qualification precedes any drafting qualification. The API still uses the checkpoint's sampling defaults unless temperature is explicitly zero. Vision input is rejected in this initial text release.

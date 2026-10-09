@@ -432,6 +432,9 @@ struct GpuModel {
     if (g_gguf && gr_bf16 && !f32_gemm_bf16)
       throw std::runtime_error("Flash GGUF F32 mapping requires GDEC_GR_BF16 unset "
                                "(or GDEC_F32_GEMM_BF16=1)");
+    if (verify_f32 && gr_bf16)
+      throw std::runtime_error("GDEC_FLASH_VERIFY_F32 requires FP32 residual storage; "
+                               "leave GDEC_GR_BF16 unset");
     if (trace.active() && (gr_bf16 || !qsa_kv_fp32))
       throw std::runtime_error("Flash trace currently requires FP32 residual and KV storage");
     // Prefill workspace is sized by maxbatch, NOT maxctx: long prompts are
@@ -2013,6 +2016,14 @@ struct GpuModel {
   // matrices. P <= 8 (decode, speculative verify) keeps FP32 SGEMM. Opt-in: this
   // changes prefill arithmetic and needs its own quality gate.
   bool f32_gemm_bf16 = getenv("GDEC_F32_GEMM_BF16") != nullptr;
+  // S1 experiment: fixed-order F32 projections for all 1..9-row batches,
+  // including the final mixer after spec_snap has been cleared. Large prompt
+  // batches keep their existing GEMM dispatch. Other verify arithmetic and
+  // state restoration still need end-to-end qualification; default is off.
+  bool verify_f32 = getenv("GDEC_FLASH_VERIFY_F32") != nullptr;
+  // Avoid the discarded single-row head/host sync before batch logits in MTP
+  // and chain verification. Off until the corresponding model checks run.
+  bool verify_no_final = getenv("GDEC_FLASH_VERIFY_NO_FINAL") != nullptr;
   // Chlorine: fused single-token kernels in serial decode (28_chlorine_iq.inc),
   // bit-identical to the separate launches. GDEC_FLASH_DECODE_FUSE=0 opts out.
   bool dec_fuse = !env_zero("GDEC_FLASH_DECODE_FUSE");
@@ -2088,7 +2099,8 @@ struct GpuModel {
     // bf16-exact F32 matrix on the batched bf16 route: continue as dense bf16.
     // With a bf16 residual stream (gr_bf16) every batch size takes it, because
     // the FP32 input an SGEMM would need is not maintained in that mode.
-    if (w.dtype == 1 && f32_gemm_bf16 && (P > 8 || gr_bf16)) {
+    if (w.dtype == 1 && f32_gemm_bf16 && (P > 8 || gr_bf16) &&
+        !(verify_f32 && P >= 1 && P <= kFlashVerifyF32MaxRows)) {
       if (const uint16_t* exact = f32_exact_bf16(w)) {
         WView dense = w;
         dense.dtype = 0;
@@ -2118,6 +2130,12 @@ struct GpuModel {
     // batched route was diverted by gemm() before reaching here).
     if(w.dtype == 1) {
       if (!x) throw std::runtime_error("flash f32 gemm requires float input");
+      if (verify_f32 && flash_f32_small_batch((const float*)w.data, x, y,
+                                             (int)N, (int)K, P, xstride, g_str)) {
+        if (prof) p_gemm += std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-pt0).count();
+        return;
+      }
       float one=1.f, zero=0.f;
       rocblas_set_stream(rbh,g_str);
       auto st=rocblas_sgemm(rbh,rocblas_operation_transpose,rocblas_operation_none,
@@ -2894,41 +2912,22 @@ struct GpuModel {
             nullptr, base, ptab);
       else if constexpr (sizeof(KVT) == 2) {
         if (qsa_union && vc_transposed) {
-          // 并集路径：[ga, ge) 内的 4 对齐完整组走 merge + k_qsa_wmma_u，
-          // 两侧 ragged 边缘回退逐 token 的 k_qsa_wmma<true>
-          const int ga = (first_abs + 3) & ~3;
-          // Chlorine: union block ids are uint16 and 0xFFFF is the padding value,
-          // so the group whose own block is 65535 (tokens 262,140..262,143, the
-          // last four of the native context) stays on the per-token kernel.
-          const int ge_all = (base + P) & ~3;
-          const int ge = std::min(ge_all, 65535 * 4);
-          if (ge < ge_all && ge - ga < 4) {
-            // the batch reaches only that last group
-            k_qsa_wmma<true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
-                d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel, first_abs,
-                base);
-          } else {
-            if (ge - ga >= 4) {
-              const int ngroups = (ge - ga) >> 2;
-              k_qsa_union_merge<<<ngroups, 128, 0, g_str>>>(
-                  d_iselected, ga, d_ublk, d_umask, d_ucount, QSA_UCAP, base);
-              k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
-                  d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
-                  d_ucount, QSA_UCAP, ga, base);
-            }
-            if (ga > first_abs)
-              k_qsa_wmma<true><<<dim3(ga - first_abs, 2), 256, 0, g_str>>>(
-                  d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24, sel,
-                  first_abs, base);
-            // Chlorine fix: the kernel reads selection row blockIdx.x of the
-            // pointer it is given, so the tail needs the rows of tokens ge.. and
-            // not `sel` (the rows of first_abs..). As imported, a batch that
-            // ended off a 4-token boundary gave its last one to three tokens
-            // the block lists of the first sparse tokens.
-            if (base + P > ge)
-              k_qsa_wmma<true><<<dim3(base + P - ge, 2), 256, 0, g_str>>>(
+          // Exact coverage even for a short, unaligned continuation; the
+          // native-context sentinel block is also kept on per-query attention.
+          const auto ranges = chlorine_flash::qsa_union_partition(first_abs, base + P);
+          if (ranges.groups.count) {
+            const int ngroups = ranges.groups.count / 4;
+            k_qsa_union_merge<<<ngroups, 128, 0, g_str>>>(
+                d_iselected, ranges.groups.first, d_ublk, d_umask, d_ucount, QSA_UCAP, base);
+            k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
+                d_qsb, kc, vc_transposed, d_attnb, 256, 2, 24, d_ublk, d_umask,
+                d_ucount, QSA_UCAP, ranges.groups.first, base);
+          }
+          for (const auto edge : {ranges.head, ranges.tail}) {
+            if (edge.count)
+              k_qsa_wmma<true><<<dim3(edge.count, 2), 256, 0, g_str>>>(
                   d_qsb, kc, vc, vc_transposed, d_attnb, P, 256, 2, 24,
-                  sel + (size_t)(ge - first_abs) * 512, ge, base);
+                  sel + (size_t)(edge.first - first_abs) * 512, edge.first, base);
           }
         }
         else if (qsa_wmma6 && vc_transposed)
@@ -5809,7 +5808,7 @@ struct GpuModel {
       vt.push_back(cur);
       for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
       spec_snap = true;  // capture per-row rollback snapshots during verify
-      prefill_batch(vt, q + 1, true, true);
+      prefill_batch(vt, q + 1, !verify_no_final, true);
       spec_snap = false;
       batch_argmax(g + 1, v.data());
       if (!spec_force.empty())  // v[j] predicts out[out.size() + j]
@@ -6174,7 +6173,7 @@ struct GpuModel {
         vt.push_back(cur);
         for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
         spec_snap = true;  // capture per-row rollback snapshots during verify
-        prefill_batch(vt, q + 1, true, true);
+        prefill_batch(vt, q + 1, !verify_no_final, true);
         spec_snap = false;
         batch_argmax(g + 1, v.data());
         verify_ms += elapsed(t0);
@@ -6356,7 +6355,7 @@ struct GpuModel {
       vt.push_back(cur);
       for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
       spec_snap = true;
-      prefill_batch(vt, q + 1, true, true);
+      prefill_batch(vt, q + 1, !verify_no_final, true);
       spec_snap = false;
       bool smg_v = false;
       if (smg) {
@@ -6884,7 +6883,7 @@ struct GpuModel {
         vt.push_back(cur);
         for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
         spec_snap = true;  // capture per-row rollback snapshots during verify
-        prefill_batch(vt, q + 1, true, true);
+        prefill_batch(vt, q + 1, !verify_no_final, true);
         spec_snap = false;
         bool smg_v = false;
         if (smg) {

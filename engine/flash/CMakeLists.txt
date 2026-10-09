@@ -24,6 +24,8 @@ add_test(NAME flash-index-reference COMMAND flash-index-reference)
 add_executable(flash-attention-reference tests/attention_reference_test.cpp)
 target_compile_options(flash-attention-reference PRIVATE -ffp-contract=off)
 add_test(NAME flash-attention-reference COMMAND flash-attention-reference)
+add_executable(flash-qsa-union-partition tests/qsa_union_partition_test.cpp)
+add_test(NAME flash-qsa-union-partition COMMAND flash-qsa-union-partition)
 add_executable(flash-mtp-state-reference tests/mtp_state_reference_test.cpp)
 add_test(NAME flash-mtp-state-reference COMMAND flash-mtp-state-reference)
 add_executable(flash-trace-test tests/trace_test.cpp)
@@ -73,7 +75,7 @@ if(FLASH_BUILD_GPU)
       --hipcc ${HIPCC_EXECUTABLE} --ple-causal $<BOOL:${FLASH_PLE_CAUSAL}>
       --gguf-direct-decay $<BOOL:${FLASH_GGUF_DIRECT_DECAY}>
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/chlorine-flash.build.json
-    DEPENDS ${FLASH_HIP_DEPS} model_config.hpp ple_contract.hpp mapping_contract.hpp trace.hpp write_build_info.py VERBATIM)
+    DEPENDS ${FLASH_HIP_DEPS} model_config.hpp ple_contract.hpp mapping_contract.hpp qsa_union_partition.hpp trace.hpp write_build_info.py VERBATIM)
   add_custom_target(flash-engine ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/chlorine-flash)
 endif()
 if(FLASH_BUILD_API)
@@ -100,7 +102,7 @@ if(FLASH_BUILD_GPU)
         -I${CMAKE_CURRENT_SOURCE_DIR}/upstream/src/gpu
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/${check}.hip -lrocblas -lhipblaslt
         -o ${CMAKE_CURRENT_BINARY_DIR}/${check}
-      DEPENDS tests/${check}.hip ${FLASH_TEST_DEPS} ${FLASH_HIP_DEPS} model_config.hpp ple_contract.hpp mapping_contract.hpp trace.hpp VERBATIM)
+      DEPENDS tests/${check}.hip ${FLASH_TEST_DEPS} ${FLASH_HIP_DEPS} model_config.hpp ple_contract.hpp mapping_contract.hpp qsa_union_partition.hpp trace.hpp VERBATIM)
     add_custom_target(${check}-build ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${check})
   endforeach()
   foreach(format IN ITEMS iq3s iq4xs iq4nl)

@@ -99,6 +99,29 @@ int main() {
         k_flash_f32_gemv<<<dim3(FR,FT),256>>>(fw.p,fx.p,f1.p,FR,FK,FS);
         checked(hipDeviceSynchronize());cmp(f0.get(),f1.get());
       }
+      {
+        // S1 F32 route: cover every supported verify length, including the
+        // ninth row at draft depth eight, and non-contiguous activation rows.
+        const size_t before = diffs;
+        size_t compared = 0;
+        for (int FK : {320, 2560, 10240}) for (int FT = 1; FT <= 9; ++FT) {
+          constexpr int FR = 37;
+          const int FS = FK + 64;
+          Buffer<float> fw(randv(size_t(FR)*FK,.05f)),fx(randv(size_t(FT)*FS,1.f));
+          Buffer<float> serial(size_t(FT)*FR),batch(size_t(FT)*FR);
+          WView view{1,(uint8_t*)fw.p,FR,(uint64_t)FK,0};
+          for (int t = 0; t < FT; ++t) gemv(view,fx.p+size_t(t)*FS,serial.p+size_t(t)*FR);
+          if (!flash_f32_small_batch(fw.p,fx.p,batch.p,FR,FK,FT,FS,g_str))
+            throw std::runtime_error("verify F32 batch dispatch missing");
+          checked(hipDeviceSynchronize());checked(hipGetLastError());
+          cmp(serial.get(),batch.get());compared+=size_t(FT)*FR;
+        }
+        if (flash_f32_small_batch(nullptr,nullptr,nullptr,37,2560,10,2560,g_str))
+          throw std::runtime_error("verify F32 route accepted an unsupported batch");
+        printf("verify_f32_batch_vs_serial rows=1..9 widths=320,2560,10240 n=%zu bit_diffs=%zu\n",
+               compared,diffs-before);
+        if (diffs != before) throw std::runtime_error("verify F32 batch identity failure");
+      }
       Buffer<float> G(randv(K4,2.f)),G2(K4),Rh(randv(K4,1.f)),x0(D),x1(D);
       checked(hipMemcpy(G2.p,G.p,K4*4,hipMemcpyDeviceToDevice));
       k_sigmoid_inplace<<<(K4+255)/256,256>>>(G2.p,K4);k_gr_combine<<<(D+255)/256,256>>>(G2.p,Rh.p,x0.p,D,4);

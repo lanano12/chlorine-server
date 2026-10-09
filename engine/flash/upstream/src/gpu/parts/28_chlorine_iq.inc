@@ -274,6 +274,19 @@ __global__ void k_flash_f32_gemv(const float* w,const float* x,float* out,int n,
   if(tid==0)out[(size_t)t*n+r]=total;
 }
 
+// One current token plus at most eight MTP drafts. Each batch row uses exactly
+// the serial F32 dot kernel, including its lane partials and reduction tree.
+// This is an S1 projection building block, not a whole-verifier identity claim.
+constexpr int kFlashVerifyF32MaxRows = 9;
+static bool flash_f32_small_batch(const float* w,const float* x,float* out,
+                                  int n,int k,int P,size_t xs,hipStream_t st) {
+  if (P < 1 || P > kFlashVerifyF32MaxRows) return false;
+  if (!w || !x || !out || n < 1 || k < 1 || xs < (size_t)k)
+    throw std::runtime_error("Flash small F32 batch: invalid shape or input");
+  k_flash_f32_gemv<<<dim3(n,P),256,0,st>>>(w,x,out,n,k,xs);
+  return true;
+}
+
 // --- Fused single-token kernels (serial decode) -----------------------------
 // A decoded token issues about 37 small kernels per layer, and every launch
 // costs time whatever its size. Each kernel below replaces two or three
